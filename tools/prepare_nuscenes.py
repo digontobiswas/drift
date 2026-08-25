@@ -544,9 +544,10 @@ def process_sample(
     out_npz.parent.mkdir(parents=True, exist_ok=True)
     # np.savez_compressed() automatically appends .npz, so pass the stem without it.
     # If we passed "file.npz.tmp", it would create "file.npz.tmp.npz".
-    tmp_stem = out_npz.with_suffix("").with_suffix(".tmp")  # e.g., file.tmp (no .npz)
+    # Use string concatenation to avoid with_suffix() replacing the .tmp part.
+    tmp_stem = str(out_npz).replace(".npz", ".tmp")  # e.g., file.tmp (no .npz)
     np.savez_compressed(tmp_stem, **payload)  # numpy creates file.tmp.npz
-    tmp = tmp_stem.with_suffix(".npz")  # rename to file.tmp.npz for replace()
+    tmp = Path(tmp_stem + ".npz")  # explicitly add .npz to get file.tmp.npz
     os.replace(tmp, out_npz)
     return entry
 
