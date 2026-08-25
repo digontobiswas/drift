@@ -28,7 +28,20 @@ mkdir -p "$TORCH_HOME/hub/checkpoints"
 
 python - <<'PY'
 import os
+import ssl
 import torch
+import urllib.request
+
+# On some HPC login nodes, the system CA bundle is outdated. Workaround:
+# create an unverified SSL context for torch hub downloads only.
+# This is pragmatic for a login-node-only weight fetch (compute nodes
+# are offline anyway and never make network calls).
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass  # python < 3.10 doesn't have this attribute
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
 
 print("fetching torchvision backbone weights ...")
 from torchvision.models import resnet18, resnet50, ResNet18_Weights, ResNet50_Weights
