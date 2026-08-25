@@ -49,16 +49,33 @@ def _build(grad_checkpoint: bool) -> tuple:
 
 
 class TestGradCheckpointEquivalence:
-    def test_flag_reaches_the_forecaster(self) -> None:
-        """DRIFT must propagate the flag into the forecaster, which holds the
-        largest volumes; a plain model must leave it off."""
+    def test_flag_reaches_every_submodule_that_declares_it(self) -> None:
+        """DRIFT propagates the flag to every submodule with its own `grad_checkpoint`.
+
+        A half-applied flag is the failure mode this guards: the model still trains,
+        just with a silently larger memory peak, which presents as "checkpointing
+        didn't help" rather than as an error. Both the forecaster (largest volumes)
+        and every EfficientAggregation4D (whose per-stage checkpointing is what keeps
+        the *backward* recompute peak down) must be switched on.
+        """
         on, _ = _build(grad_checkpoint=True)
         off, _ = _build(grad_checkpoint=False)
         assert on.grad_checkpoint is True
         assert off.grad_checkpoint is False
-        if on.forecaster is not None:
-            assert on.forecaster.grad_checkpoint is True
-            assert off.forecaster.grad_checkpoint is False
+
+        on_subs = [m for m in on.modules() if m is not on and hasattr(m, "grad_checkpoint")]
+        off_subs = [m for m in off.modules() if m is not off and hasattr(m, "grad_checkpoint")]
+        assert on_subs, "no submodule declares grad_checkpoint -- propagation is untested"
+        assert all(m.grad_checkpoint for m in on_subs), [
+            type(m).__name__ for m in on_subs if not m.grad_checkpoint
+        ]
+        assert not any(m.grad_checkpoint for m in off_subs)
+
+        from drift.models.e4a import EfficientAggregation4D
+
+        e4as = [m for m in on.modules() if isinstance(m, EfficientAggregation4D)]
+        assert e4as, "expected at least one EfficientAggregation4D in the model"
+        assert all(m.grad_checkpoint for m in e4as)
 
     def test_outputs_and_grads_match_uncheckpointed(self) -> None:
         plain, batch = _build(grad_checkpoint=False)

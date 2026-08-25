@@ -343,9 +343,6 @@ class DRIFT(nn.Module):
                 instance_cfg=instance_cfg, condition_cfg=condition_cfg, merge=cfg.forecaster.merge,
                 latent_size=cfg.latent_size, point_cloud_range=cfg.point_cloud_range,
             )
-            # Propagate the memory/compute trade into the forecaster's own internals,
-            # which hold the largest volumes in the model.
-            self.forecaster.grad_checkpoint = self.grad_checkpoint
             self.static_path = None
             self.dense_flow_fallback = None
             self.fallback_gate = None
@@ -376,6 +373,16 @@ class DRIFT(nn.Module):
             )
             if cfg.uncertainty.enabled else None
         )
+
+        # Propagate the flag to every submodule that declares its own `grad_checkpoint`
+        # (currently DecoupledForecaster and EfficientAggregation4D). Done generically
+        # rather than by naming each one so a module that grows its own fine-grained
+        # checkpointing later is picked up automatically -- and so the flag can never be
+        # silently half-applied, which would look like "checkpointing didn't help".
+        if self.grad_checkpoint:
+            for module in self.modules():
+                if module is not self and hasattr(module, "grad_checkpoint"):
+                    module.grad_checkpoint = True
 
     def _ckpt(self, fn: Any, *args: Any) -> Any:
         """Run ``fn(*args)`` under gradient checkpointing when it is enabled.
@@ -520,7 +527,12 @@ class DRIFT(nn.Module):
                 "static_latent": static_latent, "dyn_latent": dyn_latent, "present_state": None,
             }
 
-        refined = self._ckpt(self.refiner, obs, future_latent)  # (B,T_o,C,X,Y,Z)
+        # NOT wrapped in a coarse _ckpt: the refiner's bulk is EfficientAggregation4D,
+        # which now checkpoints each of its own stages. Wrapping the whole refiner on top
+        # of that made backward recompute every E4A activation simultaneously -- a larger
+        # peak than not checkpointing it at all, and the direct cause of an OOM inside
+        # the recompute (e4a -> taf) rather than in the forward pass.
+        refined = self.refiner(obs, future_latent)  # (B,T_o,C,X,Y,Z)
 
         occ_logits = self._ckpt(self.occ_head, refined)
         flow_pred = self._ckpt(self.flow_head, refined)

@@ -20,10 +20,11 @@ This keeps E4A correct for arbitrary (including odd or tiny) spatial sizes while
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint  # explicit: `import torch` alone need not bind this submodule
 from torch import Tensor, nn
 
 from drift.models.taf import TriplingAttentionFusion
@@ -141,6 +142,43 @@ class EfficientAggregation4D(nn.Module):
 
         self.out_proj = nn.Conv3d(embed_dims, self.out_channels, kernel_size=1)
 
+        # Set by DRIFT.__init__ (propagated to every submodule declaring this attribute).
+        # See DRIFT._ckpt. Checkpointing matters *per stage* here rather than for the
+        # module as a whole: an outer checkpoint around the whole refiner still has to
+        # materialise every E4A activation at once when backward recomputes it, which is
+        # exactly where a 16 GB V100 runs out. Checkpointing each stage separately keeps
+        # the recompute peak to one stage even when an outer checkpoint re-runs this
+        # forward.
+        self.grad_checkpoint = False
+
+    def _ckpt(self, fn: Any, *args: Any) -> Any:
+        """Gradient-checkpoint ``fn(*args)`` when enabled. Mirrors ``DRIFT._ckpt``."""
+        if not (self.grad_checkpoint and self.training and torch.is_grad_enabled()):
+            return fn(*args)
+        return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False)
+
+    def _down_stage(self, k: int, x: Tensor, size: Tuple[int, int, int]) -> Tensor:
+        x = F.interpolate(x, size=size, mode="nearest")
+        return self.downs[k](x)
+
+    def _up_stage(
+        self, i: int, x: Tensor, skip: Tensor, target_size: Tuple[int, int, int], b: int, t: int
+    ) -> Tensor:
+        """One decoder level: upsample, reduce, fuse the skip, then the TAF plugin.
+
+        Grouped into a single function so the whole level -- including the widest
+        tensor in it, the post-``cat`` fusion input -- can be checkpointed as a unit.
+        """
+        x = F.interpolate(x, size=target_size, mode="trilinear", align_corners=False)
+        x = self.up_reduce[i](x)
+        x = torch.cat([x, skip], dim=1)
+        x = self.up_fuse[i](x)
+
+        c_cur = x.shape[1]
+        x_5d = x.reshape(b, t, c_cur, *target_size)
+        x_5d = self.plugins[i](x_5d)
+        return x_5d.reshape(b * t, c_cur, *target_size)
+
     def forward(self, vox_feats: Tensor) -> Union[Tensor, List[Tensor]]:
         """
         Args:
@@ -171,25 +209,15 @@ class EfficientAggregation4D(nn.Module):
         x = self.in_proj(x)
 
         skips = [x]
-        for k, down in enumerate(self.downs, start=1):
-            x = F.interpolate(x, size=sizes[k], mode="nearest")
-            x = down(x)
+        for k in range(1, self.downsample_layers + 1):
+            x = self._ckpt(self._down_stage, k - 1, x, sizes[k])
             skips.append(x)
 
         outputs: List[Tensor] = []
         for i in range(self.downsample_layers):
             level = self.downsample_layers - i  # current source level (counting down)
             target_size = sizes[level - 1]
-            x = F.interpolate(x, size=target_size, mode="trilinear", align_corners=False)
-            x = self.up_reduce[i](x)
-            skip = skips[level - 1]
-            x = torch.cat([x, skip], dim=1)
-            x = self.up_fuse[i](x)
-
-            c_cur = x.shape[1]
-            x_5d = x.reshape(b, t, c_cur, *target_size)
-            x_5d = self.plugins[i](x_5d)
-            x = x_5d.reshape(b * t, c_cur, *target_size)
+            x = self._ckpt(self._up_stage, i, x, skips[level - 1], target_size, b, t)
             outputs.append(x)
 
         final = self.out_proj(x)
