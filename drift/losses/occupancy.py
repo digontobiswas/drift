@@ -263,7 +263,11 @@ def downsample_target(target: Tensor, ratio: int = 4) -> Tensor:
         ratio: Block edge length (e.g. `4` for 512 -> 128).
 
     Returns:
-        Integer labels `(..., X/ratio, Y/ratio, Z/ratio)`, same dtype as `target`.
+        Integer labels `(..., X/ratio, Y/ratio, Z/ratio)` as `int64`, ready to use
+        directly as a `cross_entropy` target. The output is at latent resolution and
+        therefore small, so it is always widened to `int64` rather than echoing
+        `target`'s dtype -- callers pass a compact `uint8` full-resolution grid (see
+        `Cam4DOccDataset`), and `F.cross_entropy` requires a `Long` target.
     """
     if target.dim() < 3:
         raise ValueError(f"target must have at least 3 dims (...,X,Y,Z), got shape {tuple(target.shape)}")
@@ -273,7 +277,6 @@ def downsample_target(target: Tensor, ratio: int = 4) -> Tensor:
             f"spatial dims {(X, Y, Z)} must all be divisible by ratio={ratio}, got shape {tuple(target.shape)}"
         )
     Xl, Yl, Zl = X // ratio, Y // ratio, Z // ratio
-    dtype = target.dtype
     device = target.device
 
     num_classes = int(target.max().item()) + 1 if target.numel() > 0 else 1
@@ -292,10 +295,22 @@ def downsample_target(target: Tensor, ratio: int = 4) -> Tensor:
     ]
     blocks = blocks.permute(*perm).contiguous()
     K = ratio * ratio * ratio
-    flat = blocks.reshape(-1, K).long()
+    # Deliberately NOT widened to int64 here: at the real resolution this tensor is
+    # (B*T_o*Xl*Yl*Zl, 64) == every voxel of the full-res grid, so a `.long()` copy of
+    # it costs ~500 MB on its own.
+    flat = blocks.reshape(-1, K)
 
-    # Per-block class histogram via one-hot sum -- cheap since num_classes is small.
-    counts = F.one_hot(flat, num_classes=num_classes).sum(dim=1)  # (M, num_classes)
+    # Per-block class histogram, one class at a time.
+    #
+    # The obvious `F.one_hot(flat, num_classes).sum(dim=1)` allocates an
+    # (M, K, num_classes) int64 intermediate -- at the real Cam4DOcc resolution that is
+    # ~1.5 GB for a single batch element, enough on its own to push a 16 GB V100 into
+    # OOM. Comparing against one class at a time costs a transient (M, K) bool instead
+    # (~63 MB) and is reused across iterations by the caching allocator. num_classes is
+    # small (3 for GMO, 17 for lidarseg), so the loop is short.
+    counts = torch.stack(
+        [(flat == c).sum(dim=1) for c in range(num_classes)], dim=1
+    )  # (M, num_classes), int64
     nonempty_count = K - counts[:, 0]
     counts_nonzero = counts.clone()
     counts_nonzero[:, 0] = -1  # never selected as the majority class
@@ -308,7 +323,7 @@ def downsample_target(target: Tensor, ratio: int = 4) -> Tensor:
     out = torch.where(all_empty, torch.zeros_like(out), out)
     out = torch.where(has_majority, mode_class, out)
 
-    out = out.reshape(*lead, Xl, Yl, Zl).to(dtype=dtype, device=device)
+    out = out.reshape(*lead, Xl, Yl, Zl).to(dtype=torch.long, device=device)
     return out
 
 

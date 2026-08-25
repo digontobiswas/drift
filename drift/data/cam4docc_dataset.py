@@ -250,16 +250,26 @@ class Cam4DOccDataset(Dataset):
         vals_inst = np.asarray(npz["sparse_instance"], dtype=np.int64)
 
         T_o = int(counts.shape[0])
-        occ = torch.zeros((T_o, *occ_size), dtype=torch.long)
-        inst = torch.zeros((T_o, *occ_size), dtype=torch.long)
+        # These are the largest tensors in a batch: (T_o, 512, 512, 40) is ~63 M voxels,
+        # which as int64 would be ~500 MB *each* on the GPU. Store them at the width the
+        # values actually need -- uint8 for the 3 GMO class ids (255 is the ignore index
+        # and still fits), int16 for instance ids -- and widen only where a consumer
+        # requires int64 (`downsample_target` returns a Long target for cross_entropy).
+        # This alone frees ~800 MB of GPU memory per step at batch_size=1.
+        occ = torch.zeros((T_o, *occ_size), dtype=torch.uint8)
+        inst = torch.zeros((T_o, *occ_size), dtype=torch.int16)
         offset = 0
         for t in range(T_o):
             n = int(counts[t])
             if n == 0:
                 continue
             c = coords[offset : offset + n]
-            occ[t, c[:, 0], c[:, 1], c[:, 2]] = torch.from_numpy(vals_occ[offset : offset + n])
-            inst[t, c[:, 0], c[:, 1], c[:, 2]] = torch.from_numpy(vals_inst[offset : offset + n])
+            occ[t, c[:, 0], c[:, 1], c[:, 2]] = torch.from_numpy(
+                vals_occ[offset : offset + n]
+            ).to(torch.uint8)
+            inst[t, c[:, 0], c[:, 1], c[:, 2]] = torch.from_numpy(
+                vals_inst[offset : offset + n]
+            ).to(torch.int16)
             offset += n
         return occ, inst
 
@@ -307,8 +317,10 @@ class Cam4DOccDataset(Dataset):
             if "sparse_counts" in keys:
                 gt_occ, gt_instance = self._decode_sparse(npz)
             else:
-                gt_occ = torch.from_numpy(npz["gt_occ"]).long()
-                gt_instance = torch.from_numpy(npz["gt_instance"]).long()
+                # Legacy dense layout. Same compact widths as the sparse path above --
+                # see _decode_sparse for why these are not int64.
+                gt_occ = torch.from_numpy(npz["gt_occ"]).to(torch.uint8)
+                gt_instance = torch.from_numpy(npz["gt_instance"]).to(torch.int16)
             T_o = gt_occ.shape[0]
 
             rots = torch.from_numpy(npz["rots"]).float()
@@ -701,8 +713,14 @@ class SyntheticOccDataset(Dataset):
         inst_latent_stack = np.stack(inst_latents, axis=0)
         gt_flow = torch.from_numpy(np.stack(flow_latents, axis=0))  # (T_o,3,X,Y,Z)
 
-        gt_occ = torch.stack([self._upsample_occ(occ_latent_stack[t]) for t in range(self.T_o)], dim=0).long()
-        gt_instance = torch.stack([self._upsample_occ(inst_latent_stack[t]) for t in range(self.T_o)], dim=0).long()
+        # Match Cam4DOccDataset's compact widths so the synthetic and real datasets are
+        # interchangeable in tests and in the smoke path (see _decode_sparse).
+        gt_occ = torch.stack(
+            [self._upsample_occ(occ_latent_stack[t]) for t in range(self.T_o)], dim=0
+        ).to(torch.uint8)
+        gt_instance = torch.stack(
+            [self._upsample_occ(inst_latent_stack[t]) for t in range(self.T_o)], dim=0
+        ).to(torch.int16)
 
         # Points: generated from the *first future* frame's occupancy for the present frame,
         # and reuse each past frame's own (independently sampled but similarly-shaped) scene.
