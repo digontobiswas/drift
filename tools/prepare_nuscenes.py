@@ -542,8 +542,11 @@ def process_sample(
         payload[f"box_{field}"] = np.array([f.boxes[field] for f in frames], dtype=object)
 
     out_npz.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_npz.with_suffix(".npz.tmp")
-    np.savez_compressed(tmp, **payload)
+    # np.savez_compressed() automatically appends .npz, so pass the stem without it.
+    # If we passed "file.npz.tmp", it would create "file.npz.tmp.npz".
+    tmp_stem = out_npz.with_suffix("").with_suffix(".tmp")  # e.g., file.tmp (no .npz)
+    np.savez_compressed(tmp_stem, **payload)  # numpy creates file.tmp.npz
+    tmp = tmp_stem.with_suffix(".npz")  # rename to file.tmp.npz for replace()
     os.replace(tmp, out_npz)
     return entry
 
