@@ -44,16 +44,22 @@ else:
     ssl._create_default_https_context = _create_unverified_https_context
 
 print("fetching torchvision backbone weights ...")
-from torchvision.models import resnet18, resnet50, ResNet18_Weights, ResNet50_Weights
+import torchvision.models as tvm
 
 # configs/base.py: CameraEncoderConfig.backbone is resnet50 for the real presets,
 # resnet18 for `tiny`. Fetch both so every preset runs offline.
-for name, fn, w in (
-    ("resnet50", resnet50, ResNet50_Weights.IMAGENET1K_V1),
-    ("resnet18", resnet18, ResNet18_Weights.IMAGENET1K_V1),
-):
-    fn(weights=w)
-    print(f"  {name}: ok")
+#
+# Resolve the weights enum exactly the way drift/models/encoders/camera_encoder.py
+# does -- `tvm.get_model_weights(name).DEFAULT`. Do NOT hardcode IMAGENET1K_V1
+# here: for resnet50, DEFAULT is IMAGENET1K_V2 (resnet50-11ad3fa6.pth), so
+# pinning V1 (resnet50-0676ba61.pth) cached a file the model never asks for. The
+# compute node then tried to download the V2 file, failed (no internet), and
+# silently fell back to random init -- which quietly invalidates every ablation
+# number. Mirroring the model's own resolution keeps the two from drifting apart.
+for name in ("resnet50", "resnet18"):
+    weights = tvm.get_model_weights(name).DEFAULT
+    tvm.get_model(name, weights=weights)
+    print(f"  {name}: ok ({weights})")
 
 print(f"\ncached under {os.environ['TORCH_HOME']}/hub/checkpoints:")
 for f in sorted(os.listdir(os.path.join(os.environ["TORCH_HOME"], "hub", "checkpoints"))):

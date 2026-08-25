@@ -70,6 +70,13 @@ export LD_LIBRARY_PATH="${DRIFT_EXTRA_LD_PATH:-}${DRIFT_EXTRA_LD_PATH:+:}${LD_LI
 
 export PYTHONUNBUFFERED=1                  # so .out logs stream instead of buffering
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+
+# The gpu partition's V100s have 16 GiB, and this model runs close to that ceiling
+# even at batch_size=1. Allocating the forecaster's gate-concat repeatedly against
+# a fragmented caching allocator wasted ~850 MiB of reserved-but-unallocated blocks
+# and turned a fit into an OOM. expandable_segments lets the allocator grow existing
+# segments instead of stranding them at fixed sizes.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export HF_HUB_OFFLINE=1                    # never attempt a network fetch on a compute node
 export TORCH_HUB_OFFLINE=1
 export PYTHONPATH="$DRIFT_REPO:${PYTHONPATH:-}"
