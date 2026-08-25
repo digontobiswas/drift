@@ -106,7 +106,11 @@ def _warp_feature_volume(
     ones = torch.ones_like(gx)
     pts_out = torch.stack([gx, gy, gz, ones], dim=-1)  # (X,Y,Z,4) homogeneous, in OUTPUT frame
 
-    transform_in_from_out = torch.linalg.inv(transform_out_from_in)  # (B,4,4)
+    # torch.linalg.inv refuses low-precision dtypes (Half/BFloat16) outright, and even if it
+    # didn't, a 4x4 rigid-transform inverse is numerically sensitive enough that fp16 would be
+    # a bad idea under AMP autocast. Always invert in fp32, then cast back to match `vol`'s
+    # dtype for the downstream bmm/grid_sample, which require matching operand dtypes.
+    transform_in_from_out = torch.linalg.inv(transform_out_from_in.float()).to(dtype)  # (B,4,4)
     pts_out_flat = pts_out.reshape(1, -1, 4).expand(B, -1, -1)  # (B, X*Y*Z, 4)
     pts_in = torch.bmm(pts_out_flat, transform_in_from_out.transpose(1, 2))  # (B, X*Y*Z, 4)
     pts_in = pts_in[..., :3].reshape(B, X, Y, Z, 3)

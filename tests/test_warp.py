@@ -98,6 +98,52 @@ class TestComposeFutureTransforms:
         assert torch.allclose(future_ego[:, 1, 0, 3], torch.tensor([2.0]), atol=1e-6)
 
 
+class TestHalfPrecisionInverse:
+    """Regression test for the smoke-test crash on PARAM Shakti (job 1269089):
+
+        RuntimeError: linalg.inv: Low precision dtypes not supported. Got Half
+
+    Under AMP autocast, `feats`/`obs_latent` and the ego-motion transforms that
+    accompany them arrive as `torch.float16`. `torch.linalg.inv` refuses Half
+    inputs outright, so both `_warp_feature_volume` (via
+    `cumulative_warp_to_present`) and `StaticForecastPath.forward` must invert in
+    fp32 internally and cast back, never call `linalg.inv` directly on a Half
+    tensor. Requires CUDA: CPU `grid_sample` does not reliably support Half
+    across torch versions, and that gap is unrelated to the bug being guarded
+    against here.
+    """
+
+    _requires_cuda = torch.cuda.is_available()
+
+    def test_cumulative_warp_to_present_accepts_half(self) -> None:
+        if not self._requires_cuda:
+            import pytest
+
+            pytest.skip("needs CUDA: CPU grid_sample has inconsistent Half support")
+        device = torch.device("cuda")
+        spike = (2, 3, 4)
+        vol = _spike_volume(spike).to(device=device, dtype=torch.float16)
+        feats = torch.stack([vol, vol], dim=1)  # (1,T_p=2,C=1,X,Y,Z)
+        ego_motion = _translation(2.0, batch=1).to(device=device, dtype=torch.float16).unsqueeze(1)
+        out = cumulative_warp_to_present(feats, ego_motion, present_idx=1, point_cloud_range=_PC_RANGE)
+        assert out.dtype == torch.float16
+
+    def test_static_forecast_path_accepts_half(self) -> None:
+        if not self._requires_cuda:
+            import pytest
+
+            pytest.skip("needs CUDA: CPU grid_sample has inconsistent Half support")
+        device = torch.device("cuda")
+        path = StaticForecastPath(
+            latent_size=_SIZE, point_cloud_range=_PC_RANGE, learned_residual=False, channels=1,
+        ).to(device=device, dtype=torch.float16)
+        path.eval()
+        obs = _spike_volume((2, 4, 4)).to(device=device, dtype=torch.float16)
+        future_ego = _translation(2.0).to(device=device, dtype=torch.float16).unsqueeze(1)
+        out = path(obs, future_ego)
+        assert out.dtype == torch.float16
+
+
 class TestStaticForecastPath:
     def test_identity_future_ego_is_noop_when_residual_is_zero_init(self) -> None:
         # StaticForecastPath's learned residual conv is zero-initialized (see its module docstring

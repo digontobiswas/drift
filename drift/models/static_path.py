@@ -118,7 +118,10 @@ class StaticForecastPath(nn.Module):
         pts_future = torch.stack([gx, gy, gz, ones], dim=-1)  # (X,Y,Z,4), homogeneous
 
         # inverse of future_ego: present <- future
-        inv = torch.linalg.inv(future_ego)  # (B,T_o,4,4)
+        # Same AMP hazard as drift/data/ego_motion.py::_warp_feature_volume -- torch.linalg.inv
+        # rejects Half/BFloat16 outright, and a rigid-transform inverse deserves fp32 precision
+        # regardless. Invert in fp32, cast back to match the surrounding tensors' dtype.
+        inv = torch.linalg.inv(future_ego.float()).to(dtype)  # (B,T_o,4,4)
 
         # pts_future: (X,Y,Z,4) -> (1,1,X,Y,Z,4,1) for batched matmul against (B,T_o,1,1,1,4,4)
         pts = pts_future.reshape(1, 1, x_dim, y_dim, z_dim, 4, 1).expand(
