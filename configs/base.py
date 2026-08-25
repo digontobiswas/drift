@@ -75,9 +75,14 @@ class CMLIConfig:
     enabled: bool = True
     hidden: int = 64
     use_temporal_context: bool = True
-    lidar_drop_rate: float = 0.1
-    cam_drop_rate: float = 0.1
-    degrade_prob: float = 0.3
+    # Sensor-dropout / degradation augmentation disabled (all rates 0.0): ModalityDropout
+    # becomes a full no-op, so training sees clean, both-sensors-present frames with no
+    # dropped modalities, no LiDAR point subsampling, and no image darkening. The CMLI
+    # module still builds (enabled=True) but is simply never exercised. Restore the
+    # original 0.1 / 0.1 / 0.3 values to re-enable robustness training.
+    lidar_drop_rate: float = 0.0
+    cam_drop_rate: float = 0.0
+    degrade_prob: float = 0.0
     point_keep_range: Tuple[float, float] = (0.1, 0.5)
     darken_range: Tuple[float, float] = (0.2, 0.6)
 
