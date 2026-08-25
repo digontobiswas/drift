@@ -11,7 +11,14 @@ numpy>=1.24,<2.0
 scipy>=1.10
 
 # Image decoding for the lazily-loaded nuScenes camera frames.
-Pillow>=10.0
+# Capped below 11.0 deliberately: Pillow 11+ ships wheels only for
+# manylinux_2_28 (glibc >= 2.28). Older HPC login nodes (RHEL7/CentOS7-era,
+# glibc 2.17) have no compatible wheel for 11.x, so pip falls back to a
+# from-source build -- which then fails because the system gcc there predates
+# C99-by-default (gnu89) and can't compile Pillow's C sources. Pillow <11
+# still ships manylinux2014 (glibc 2.17) wheels, so pinning below it keeps
+# this a wheel-only install everywhere.
+Pillow>=10.0,<11.0
 
 # Raw nuScenes -> Cam4DOcc preprocessing (tools/prepare_nuscenes.py) only.
 # Nothing in drift/ imports it, so a training-only environment can drop it.

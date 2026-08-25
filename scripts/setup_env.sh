@@ -95,8 +95,20 @@ if [[ "$SSL_OK" == "1" ]]; then
     # whose build then fails looking for pybind11 -- which also only lives on PyPI.
     # So: satisfy the PyPI-side dependencies first, then torch sees them as already
     # installed and never reaches for a source build.
+    #
+    # Pillow is pinned below 11.0 and forced wheel-only (--only-binary): Pillow 11+
+    # dropped manylinux2014 wheels in favor of manylinux_2_28 (glibc >= 2.28), which
+    # older HPC login nodes (glibc 2.17) can't use -- pip would silently fall back to
+    # a from-source build, which then fails because the system gcc there predates
+    # C99-by-default and can't compile Pillow's C sources. --only-binary makes that
+    # failure an immediate, readable "no matching distribution" instead.
     echo "--- installing PyPI dependencies first (numpy, Pillow, ...) ---"
-    python -m pip install "${PIP_ARGS[@]}" "numpy>=1.24,<2.0" "Pillow>=10.0"
+    if ! python -m pip install "${PIP_ARGS[@]}" --only-binary=:all: "numpy>=1.24,<2.0" "Pillow>=10.0,<11.0"; then
+        echo "!! No prebuilt wheel for numpy/Pillow on this platform (--only-binary refused a source build)." >&2
+        echo "   This usually means the glibc here is older than manylinux2014 (glibc 2.17) expects, which" >&2
+        echo "   would be unusual. Check 'ldd --version' and consider scripts/make_wheelhouse.sh instead." >&2
+        exit 1
+    fi
 
     echo "--- installing PyTorch from $TORCH_INDEX ---"
     if ! python -m pip install "${PIP_ARGS[@]}" --index-url "$TORCH_INDEX" torch torchvision; then
