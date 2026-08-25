@@ -82,6 +82,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint  # explicit: `import torch` alone need not bind this submodule
 from torch import Tensor, nn
 
 from drift.data.ego_motion import cumulative_warp_to_present
@@ -239,6 +240,7 @@ class DRIFT(nn.Module):
         C = cfg.fusion.embed_dims
         self.C = C
         self.latent_size = (X, Y, Z)
+        self.grad_checkpoint = getattr(cfg, "grad_checkpoint", False)
 
         ratios = [o // l for o, l in zip(cfg.occ_size, cfg.latent_size)]
         if any(o % l != 0 for o, l in zip(cfg.occ_size, cfg.latent_size)) or len(set(ratios)) != 1:
@@ -341,6 +343,9 @@ class DRIFT(nn.Module):
                 instance_cfg=instance_cfg, condition_cfg=condition_cfg, merge=cfg.forecaster.merge,
                 latent_size=cfg.latent_size, point_cloud_range=cfg.point_cloud_range,
             )
+            # Propagate the memory/compute trade into the forecaster's own internals,
+            # which hold the largest volumes in the model.
+            self.forecaster.grad_checkpoint = self.grad_checkpoint
             self.static_path = None
             self.dense_flow_fallback = None
             self.fallback_gate = None
@@ -371,6 +376,29 @@ class DRIFT(nn.Module):
             )
             if cfg.uncertainty.enabled else None
         )
+
+    def _ckpt(self, fn: Any, *args: Any) -> Any:
+        """Run ``fn(*args)`` under gradient checkpointing when it is enabled.
+
+        Checkpointing drops a submodule's intermediate activations after its
+        forward and recomputes them during backward. The dense 5D latent volumes
+        here are ~500 MB apiece at ``embed_dims=128``, so keeping every one alive
+        across the whole pipeline overruns a 16 GB V100 before the backward pass
+        even starts; recomputing costs ~30% step time and nothing else -- the
+        arithmetic and therefore the results are unchanged.
+
+        Only active while training with grad enabled: under ``eval()``/``no_grad``
+        there is no backward pass to trade against, so checkpointing would be pure
+        overhead (and ``checkpoint`` warns when nothing requires grad).
+
+        ``use_reentrant=False`` is deliberate: it preserves RNG state, so
+        ``ModalityDropout`` draws the same mask on the recomputed forward as on the
+        first one. Safe against the usual double-forward hazard because every norm
+        in this model is GroupNorm, which holds no running statistics to corrupt.
+        """
+        if not (self.grad_checkpoint and self.training and torch.is_grad_enabled()):
+            return fn(*args)
+        return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False)
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Tensor]:
         """Run the full DRIFT pipeline on one batch.
@@ -423,7 +451,7 @@ class DRIFT(nn.Module):
             cam_mask = base_cam_mask
 
         if self.lidar_encoder is not None:
-            lidar_vol: Optional[Tensor] = self.lidar_encoder(points)
+            lidar_vol: Optional[Tensor] = self._ckpt(self.lidar_encoder, points)
         else:
             lidar_vol = None
             lidar_mask = torch.zeros(B, T_p, device=device, dtype=dtype)
@@ -431,7 +459,10 @@ class DRIFT(nn.Module):
         depth_pred: Optional[Tensor] = None
         if self.camera_encoder is not None:
             cam_vol: Optional[Tensor] = None
-            cam_vol, depth_pred = self.camera_encoder(imgs, cam_params)
+            # The camera encoder is the single largest activation consumer: T_p x N_cam
+            # (3 x 6 = 18) images through a ResNet50 at 256x704, plus the LSS-style depth
+            # splat. Checkpointing it is where most of the memory saving comes from.
+            cam_vol, depth_pred = self._ckpt(self.camera_encoder, imgs, cam_params)
         else:
             cam_vol = None
             cam_mask = torch.zeros(B, T_p, device=device, dtype=dtype)
@@ -463,8 +494,8 @@ class DRIFT(nn.Module):
 
         lidar_flat = lidar_vol.reshape(B * T_p, self.lidar_channels, X, Y, Z)
         cam_flat = cam_vol.reshape(B * T_p, self.cam_channels, X, Y, Z)
-        lidar_adapted = self.lidar_adapter(lidar_flat).reshape(B, T_p, C, X, Y, Z)
-        cam_adapted = self.cam_adapter(cam_flat).reshape(B, T_p, C, X, Y, Z)
+        lidar_adapted = self._ckpt(self.lidar_adapter, lidar_flat).reshape(B, T_p, C, X, Y, Z)
+        cam_adapted = self._ckpt(self.cam_adapter, cam_flat).reshape(B, T_p, C, X, Y, Z)
         fused_cmf, fusion_aux = self.cross_modal_fusion(lidar_adapted, cam_adapted)
         fused = fused_cmf + query_vol  # (B,T_p,C,X,Y,Z)
 
@@ -472,7 +503,7 @@ class DRIFT(nn.Module):
             fused, ego_motion, present_idx=T_p - 1, point_cloud_range=cfg.point_cloud_range,
         )
 
-        obs = self.observer(fused, ego_motion[:, :T_p])  # (B,T_p,C,X,Y,Z)
+        obs = self._ckpt(self.observer, fused, ego_motion[:, :T_p])  # (B,T_p,C,X,Y,Z)
 
         if self.forecaster is not None:
             future_latent, forecaster_aux = self.forecaster(obs, future_ego)
@@ -489,10 +520,10 @@ class DRIFT(nn.Module):
                 "static_latent": static_latent, "dyn_latent": dyn_latent, "present_state": None,
             }
 
-        refined = self.refiner(obs, future_latent)  # (B,T_o,C,X,Y,Z)
+        refined = self._ckpt(self.refiner, obs, future_latent)  # (B,T_o,C,X,Y,Z)
 
-        occ_logits = self.occ_head(refined)
-        flow_pred = self.flow_head(refined)
+        occ_logits = self._ckpt(self.occ_head, refined)
+        flow_pred = self._ckpt(self.flow_head, refined)
 
         log_var: Optional[Tensor] = None
         if self.uncertainty_head is not None:

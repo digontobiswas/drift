@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
+import torch.utils.checkpoint  # explicit: `import torch` alone need not bind this submodule
 from torch import Tensor, nn
 
 from drift.models.condition import ConditionalForecaster
@@ -155,6 +156,32 @@ class DecoupledForecaster(nn.Module):
         else:
             self.gate_conv = None
 
+        # Set by DRIFT.__init__ from cfg.grad_checkpoint. Deliberately not a constructor
+        # argument, so existing callers/tests that build a DecoupledForecaster directly
+        # keep working unchanged. See DRIFT._ckpt for the full rationale.
+        self.grad_checkpoint = False
+
+    def _ckpt(self, fn: Any, *args: Any) -> Any:
+        """Gradient-checkpoint ``fn(*args)`` when enabled. Mirrors ``DRIFT._ckpt``."""
+        if not (self.grad_checkpoint and self.training and torch.is_grad_enabled()):
+            return fn(*args)
+        return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False)
+
+    def _gate_merge(self, static_latent: Tensor, dyn_latent: Tensor, dyn_occ: Tensor) -> Tensor:
+        """Gated blend of the static and dynamic futures.
+
+        Split out of ``forward`` so it can be gradient-checkpointed as a unit: the
+        ``cat`` below is the widest tensor in the model (``2*C+1`` channels over the
+        full 5D latent grid, ~1 GB at C=128/T_o=6) and exists only to be consumed by
+        a 1x1 conv, so recomputing it in backward is cheap next to keeping it resident.
+        """
+        b, t_o, _, x_dim, y_dim, z_dim = static_latent.shape
+        gate_in = torch.cat([static_latent, dyn_latent, dyn_occ], dim=2)
+        gate_in = gate_in.reshape(b * t_o, 2 * self.channels + 1, x_dim, y_dim, z_dim)
+        a = torch.sigmoid(self.gate_conv(gate_in))
+        a = a.reshape(b, t_o, 1, x_dim, y_dim, z_dim)
+        return static_latent * (1 - a) + dyn_latent * a
+
     def forward(self, obs_latent: Tensor, future_ego: Tensor) -> Tuple[Tensor, Dict[str, Any]]:
         """
         Args:
@@ -183,11 +210,11 @@ class DecoupledForecaster(nn.Module):
             )
 
         present = obs_latent[:, -1]  # (B,C,X,Y,Z)
-        static_latent = self.static_path(present, future_ego)  # (B,T_o,C,X,Y,Z)
+        static_latent = self._ckpt(self.static_path, present, future_ego)  # (B,T_o,C,X,Y,Z)
 
         scene_cond_vec: Optional[Tensor] = None
         if self.condition is not None:
-            cond_latent = self.condition(obs_latent)  # (B,T_o,C,X,Y,Z)
+            cond_latent = self._ckpt(self.condition, obs_latent)  # (B,T_o,C,X,Y,Z)
             static_latent = static_latent + cond_latent
             scene_cond_vec = cond_latent.mean(dim=(1, 3, 4, 5))  # (B,C)
 
@@ -202,11 +229,7 @@ class DecoupledForecaster(nn.Module):
         dyn_latent, dyn_occ = self.instance_splatter(future_states)  # (B,T_o,C,X,Y,Z), (B,T_o,1,X,Y,Z)
 
         if self.merge == "gate":
-            gate_in = torch.cat([static_latent, dyn_latent, dyn_occ], dim=2)
-            gate_in = gate_in.reshape(b * self.num_future, 2 * self.channels + 1, x_dim, y_dim, z_dim)
-            a = torch.sigmoid(self.gate_conv(gate_in))
-            a = a.reshape(b, self.num_future, 1, x_dim, y_dim, z_dim)
-            out = static_latent * (1 - a) + dyn_latent * a
+            out = self._ckpt(self._gate_merge, static_latent, dyn_latent, dyn_occ)
         else:
             out = static_latent + dyn_latent
 

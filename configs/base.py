@@ -211,6 +211,14 @@ class ModelConfig:
     occ_size: Tuple[int, int, int] = OCC_SIZE
     use_camera: bool = True
     use_lidar: bool = True
+    # Trade compute for memory: re-run each wrapped submodule's forward during the
+    # backward pass instead of keeping its activations alive. Costs roughly 30% more
+    # step time and changes NOTHING about the model or its outputs -- the arithmetic
+    # is identical, only the order in which it happens differs. Needed to fit the
+    # dense 5D latent volumes on a 16 GB V100 (PARAM Shakti's only GPU); harmless to
+    # leave off on a larger card. Safe here because every norm in the model is
+    # GroupNorm, which keeps no running statistics for the second forward to corrupt.
+    grad_checkpoint: bool = False
     camera: CameraEncoderConfig = field(default_factory=CameraEncoderConfig)
     lidar: LidarEncoderConfig = field(default_factory=LidarEncoderConfig)
     cmli: CMLIConfig = field(default_factory=CMLIConfig)

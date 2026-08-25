@@ -83,6 +83,12 @@ def cam4docc_gmo() -> DriftConfig:
     m.T_p, m.T_f, m.T_o = 3, 4, 6
     m.num_classes = 3
     m.camera.pretrained = True  # weights are pre-fetched on the login node
+    # PARAM Shakti's only GPU is a 16 GB V100 (2 per node, 22 nodes). At full latent
+    # width the dense 5D volumes overrun that card mid-forward, before backward even
+    # allocates. Checkpointing recomputes activations instead of storing them: ~30%
+    # slower per step, identical arithmetic, identical results. Safe to turn off on a
+    # larger card. Every ablation preset inherits this, so the grid stays comparable.
+    m.grad_checkpoint = True
 
     d = cfg.data
     d.dataset = "cam4docc"
