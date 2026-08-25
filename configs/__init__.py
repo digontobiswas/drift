@@ -1,0 +1,48 @@
+"""DRIFT configuration package. See ``docs/DESIGN_SPEC.md`` §6."""
+
+from configs.base import (
+    CameraEncoderConfig,
+    CMLIConfig,
+    ConditionConfig,
+    DataConfig,
+    DriftConfig,
+    ForecasterConfig,
+    FusionConfig,
+    HeadConfig,
+    InstanceExtractorConfig,
+    LidarEncoderConfig,
+    LossConfig,
+    MotionForecasterConfig,
+    ModelConfig,
+    ObserverConfig,
+    RefinerConfig,
+    SplatterConfig,
+    StaticPathConfig,
+    TrainConfig,
+    UncertaintyConfig,
+)
+from configs.drift_fusion_nuscenes import get_config, list_configs
+
+__all__ = [
+    "DriftConfig",
+    "ModelConfig",
+    "DataConfig",
+    "TrainConfig",
+    "LossConfig",
+    "CameraEncoderConfig",
+    "LidarEncoderConfig",
+    "CMLIConfig",
+    "FusionConfig",
+    "ObserverConfig",
+    "StaticPathConfig",
+    "InstanceExtractorConfig",
+    "MotionForecasterConfig",
+    "SplatterConfig",
+    "ConditionConfig",
+    "ForecasterConfig",
+    "RefinerConfig",
+    "UncertaintyConfig",
+    "HeadConfig",
+    "get_config",
+    "list_configs",
+]
