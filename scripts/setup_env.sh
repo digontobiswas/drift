@@ -84,12 +84,27 @@ echo "venv python: $(python --version 2>&1)"
 # --- 4. Install requirements ---------------------------------------------
 PIP_ARGS=(--trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host download.pytorch.org)
 
+TORCH_INDEX="${DRIFT_TORCH_INDEX:-https://download.pytorch.org/whl/cu121}"
+
 if [[ "$SSL_OK" == "1" ]]; then
     python -m pip install --upgrade pip "${PIP_ARGS[@]}"
-    echo "--- installing PyTorch (CUDA 12.1 build) ---"
-    python -m pip install "${PIP_ARGS[@]}" \
-        --index-url https://download.pytorch.org/whl/cu121 \
-        torch torchvision
+
+    # Order matters. `--index-url` *replaces* PyPI rather than adding to it, and the
+    # PyTorch index carries only torch's own packages. Installing torchvision against
+    # it first makes pip try to build Pillow from source (no matching wheel there),
+    # whose build then fails looking for pybind11 -- which also only lives on PyPI.
+    # So: satisfy the PyPI-side dependencies first, then torch sees them as already
+    # installed and never reaches for a source build.
+    echo "--- installing PyPI dependencies first (numpy, Pillow, ...) ---"
+    python -m pip install "${PIP_ARGS[@]}" "numpy>=1.24,<2.0" "Pillow>=10.0"
+
+    echo "--- installing PyTorch from $TORCH_INDEX ---"
+    if ! python -m pip install "${PIP_ARGS[@]}" --index-url "$TORCH_INDEX" torch torchvision; then
+        echo "!! CUDA-build install failed; retrying with PyPI as a fallback index." >&2
+        echo "   (this may land a CPU-only torch -- check the verification output below)" >&2
+        python -m pip install "${PIP_ARGS[@]}" --extra-index-url "$TORCH_INDEX" torch torchvision
+    fi
+
     echo "--- installing the rest ---"
     python -m pip install "${PIP_ARGS[@]}" -r "$REPO_ROOT/requirements.txt"
 elif [[ -d "$WHEELHOUSE" ]]; then
@@ -117,17 +132,38 @@ fi
 echo "--- verifying ---"
 python - <<'PY'
 import sys
+
+problems = []
 print("python  :", sys.version.split()[0])
+
 import numpy, torch
 print("numpy   :", numpy.__version__)
+if int(numpy.__version__.split(".")[0]) >= 2:
+    problems.append("numpy is 2.x -- nuscenes-devkit needs <2.0; run: pip install 'numpy<2.0'")
+
 print("torch   :", torch.__version__, "| cuda build:", torch.version.cuda)
+if torch.version.cuda is None:
+    problems.append(
+        "torch has NO CUDA support (CPU-only build). Training will not use the GPU.\n"
+        "         Reinstall with: pip install --index-url https://download.pytorch.org/whl/cu121 "
+        "--force-reinstall torch torchvision"
+    )
 print("cuda available here:", torch.cuda.is_available(), "(False on a login node is normal)")
+
 for mod in ("torchvision", "PIL", "nuscenes"):
     try:
         __import__(mod)
         print(f"{mod:8}: ok")
-    except ImportError as e:
-        print(f"{mod:8}: MISSING ({e})")
+    except ImportError as exc:
+        print(f"{mod:8}: MISSING ({exc})")
+        problems.append(f"{mod} did not install")
+
+if problems:
+    print("\n!! problems found:")
+    for p in problems:
+        print("   -", p)
+    sys.exit(1)
+print("\nall good.")
 PY
 
 cat <<EOF
