@@ -1,0 +1,38 @@
+# Paths below are anchored with a leading slash on purpose: an unanchored
+# `data/` would also match the source package `drift/data/` and silently drop it
+# from the repo.
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments (created per-cluster by scripts/setup_env.sh)
+/drift_env/
+/venv/
+/.venv/
+
+# Offline pip wheels (built by scripts/make_wheelhouse.sh, copied by scp)
+/wheelhouse/
+/wheels/
+
+# Training outputs
+/work_dirs/
+/logs/
+*.pth
+*.ckpt
+
+# Derived dataset and results -- these live on $SCRATCH, never in git
+/data/
+/drift_data/
+/drift_runs/
+/drift_results/
+*.npz
+/results.md
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

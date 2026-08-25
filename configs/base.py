@@ -234,13 +234,22 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    """Dataset + dataloader configuration. See ``docs/DESIGN_SPEC.md`` §4."""
+    """Dataset + dataloader configuration. See ``docs/DESIGN_SPEC.md`` §4.
+
+    ``data_root``/``ann_file`` default to the ``DRIFT_DATA_ROOT`` /
+    ``DRIFT_ANN_FILE`` environment variables so that a Slurm script can point a
+    whole ablation grid at one preprocessed dataset without editing any config.
+    Both are still overridable per-run with ``--data-root`` / ``--ann-file``.
+    """
 
     dataset: str = "synthetic"  # "synthetic" | "cam4docc"
     data_root: str = ""
     ann_file: str = ""
     batch_size: int = 2
     num_workers: int = 0
+    # cam4docc-only: channels stored per point in the raw .bin. nuScenes LiDAR
+    # sweeps store 5 (x, y, z, intensity, ring); the first `in_channels` are kept.
+    point_dims_on_disk: int = 5
     # SyntheticOccDataset-only knobs (ignored for "cam4docc").
     num_samples: int = 64
     H_img: int = 256
@@ -269,6 +278,18 @@ class TrainConfig:
     device: str = "cuda"
     distributed: bool = False
     max_iters: Optional[int] = None  # if set, stop after this many optimizer steps (debug/CI)
+    # Learning-rate schedule, applied per optimizer step (not per epoch).
+    #   "constant" -- fixed `lr` throughout (the original behaviour)
+    #   "cosine"   -- linear warmup over `warmup_iters` steps, then cosine decay
+    #                 from `lr` down to `lr * min_lr_ratio` at the final step
+    #   "step"     -- linear warmup, then multiply by `step_gamma` at each of
+    #                 `step_milestones` (fractions of total training)
+    lr_scheduler: str = "cosine"
+    warmup_iters: int = 500
+    warmup_start_ratio: float = 0.001  # LR at step 0, as a fraction of `lr`
+    min_lr_ratio: float = 0.01
+    step_gamma: float = 0.1
+    step_milestones: List[float] = field(default_factory=lambda: [0.7, 0.9])
 
 
 @dataclass

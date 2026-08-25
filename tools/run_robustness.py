@@ -128,7 +128,13 @@ def build_val_dataset(cfg: DriftConfig):
                 "pre-processed Cam4DOcc-protocol val archive (see "
                 "drift.data.cam4docc_dataset.Cam4DOccDataset's docstring)."
             )
-        return Cam4DOccDataset(data_root=d.data_root, ann_file=d.ann_file, in_channels=d.in_channels)
+        return Cam4DOccDataset(
+            data_root=d.data_root,
+            ann_file=d.ann_file,
+            in_channels=d.in_channels,
+            img_hw=(d.H_img, d.W_img),
+            point_dims_on_disk=d.point_dims_on_disk,
+        )
     raise ValueError(f"Unknown dataset '{d.dataset}'.")
 
 

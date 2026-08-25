@@ -23,6 +23,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -118,7 +119,13 @@ def build_dataset(cfg: DriftConfig):
                 "pre-processed Cam4DOcc-protocol archive (see "
                 "drift.data.cam4docc_dataset.Cam4DOccDataset's docstring)."
             )
-        return Cam4DOccDataset(data_root=d.data_root, ann_file=d.ann_file, in_channels=d.in_channels)
+        return Cam4DOccDataset(
+            data_root=d.data_root,
+            ann_file=d.ann_file,
+            in_channels=d.in_channels,
+            img_hw=(d.H_img, d.W_img),
+            point_dims_on_disk=d.point_dims_on_disk,
+        )
     raise ValueError(f"Unknown dataset '{d.dataset}'.")
 
 
@@ -171,6 +178,57 @@ def setup_distributed(cfg: DriftConfig) -> "tuple[int, int, int]":
     if cfg.train.device == "cuda":
         torch.cuda.set_device(local_rank)
     return rank, world_size, local_rank
+
+
+def lr_at_step(cfg: DriftConfig, step: int, total_steps: int) -> float:
+    """Learning rate for optimizer step ``step`` (0-based) under ``cfg.train.lr_scheduler``.
+
+    Warmup is linear from ``lr * warmup_start_ratio`` up to ``lr`` over the first
+    ``warmup_iters`` steps, and applies to every non-constant schedule. After
+    warmup:
+
+    - ``"cosine"``: decays to ``lr * min_lr_ratio`` at ``total_steps``.
+    - ``"step"``:   multiplied by ``step_gamma`` at each milestone fraction.
+    - ``"constant"``: no warmup, no decay -- returns ``lr`` unchanged.
+
+    Args:
+        cfg: Full config; reads ``cfg.train``.
+        step: 0-based global optimizer step.
+        total_steps: Planned total steps for the run, used to place the decay.
+
+    Returns:
+        The learning rate to apply at this step.
+    """
+    t = cfg.train
+    base = t.lr
+    if t.lr_scheduler == "constant":
+        return base
+
+    if t.warmup_iters > 0 and step < t.warmup_iters:
+        frac = (step + 1) / float(t.warmup_iters)
+        return base * (t.warmup_start_ratio + (1.0 - t.warmup_start_ratio) * frac)
+
+    decay_steps = max(1, total_steps - t.warmup_iters)
+    progress = min(1.0, max(0.0, (step - t.warmup_iters) / float(decay_steps)))
+
+    if t.lr_scheduler == "cosine":
+        cos = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return base * (t.min_lr_ratio + (1.0 - t.min_lr_ratio) * cos)
+    if t.lr_scheduler == "step":
+        factor = 1.0
+        for m in t.step_milestones:
+            if progress >= m:
+                factor *= t.step_gamma
+        return base * max(factor, t.min_lr_ratio)
+    raise ValueError(
+        f"Unknown lr_scheduler '{t.lr_scheduler}'. Expected 'constant', 'cosine', or 'step'."
+    )
+
+
+def set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    """Write ``lr`` into every parameter group."""
+    for group in optimizer.param_groups:
+        group["lr"] = lr
 
 
 def save_checkpoint(
@@ -259,6 +317,19 @@ def main(argv: Optional[list] = None) -> None:
             print(f"[train] resumed from {cfg.train.resume} at epoch={start_epoch} step={global_step}")
 
     ckpt_dir = Path(cfg.train.ckpt_dir)
+
+    # Total planned steps, so the decay schedule lands exactly at the end of training.
+    steps_per_epoch = max(1, len(loader))
+    total_steps = steps_per_epoch * cfg.train.epochs
+    if cfg.train.max_iters is not None:
+        total_steps = min(total_steps, cfg.train.max_iters)
+    if is_main:
+        print(
+            f"[train] lr_scheduler={cfg.train.lr_scheduler} base_lr={cfg.train.lr:g} "
+            f"warmup={cfg.train.warmup_iters} total_steps={total_steps} "
+            f"({steps_per_epoch} it/epoch x {cfg.train.epochs} epochs)"
+        )
+
     stop = False
     for epoch in range(start_epoch, cfg.train.epochs):
         if sampler is not None:
@@ -267,6 +338,9 @@ def main(argv: Optional[list] = None) -> None:
         t0 = time.time()
         for it, batch in enumerate(loader):
             batch = move_batch_to_device(batch, device)
+
+            current_lr = lr_at_step(cfg, global_step, total_steps)
+            set_lr(optimizer, current_lr)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=use_amp):
@@ -291,8 +365,9 @@ def main(argv: Optional[list] = None) -> None:
                 loss_str = " ".join(f"{k}={v.item():.4f}" for k, v in losses.items())
                 elapsed = time.time() - t0
                 print(
-                    f"[train] epoch={epoch} it={it} step={global_step} "
-                    f"total_loss={total_loss.item():.4f} {loss_str} ({elapsed:.1f}s)"
+                    f"[train] epoch={epoch} it={it} step={global_step} lr={current_lr:.3e} "
+                    f"total_loss={total_loss.item():.4f} {loss_str} ({elapsed:.1f}s)",
+                    flush=True,
                 )
 
             if cfg.train.max_iters is not None and global_step >= cfg.train.max_iters:

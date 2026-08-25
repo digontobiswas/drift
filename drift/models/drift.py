@@ -571,7 +571,14 @@ class DRIFT(nn.Module):
             # detection auxiliary to shape the shared representation).
             present_state = outputs.get("present_state")
             if present_state is not None:
-                det_terms = instance_loss([present_state], gt_boxes[:1])
+                # BUGFIX: `gt_boxes` is List[B][T_o] (batch-major -- see this module's
+                # docstring and `drift.data.collate`), so the old `gt_boxes[:1]` sliced the
+                # *batch* down to one element while `instance_loss` still looped over all B
+                # states, raising IndexError for every batch size > 1. Every test ran B=1,
+                # where the two slicings coincide, so it stayed hidden until a real
+                # multi-sample run. Keep all B entries; take each one's first frame.
+                present_gt = [boxes[:1] for boxes in gt_boxes]
+                det_terms = instance_loss([present_state], present_gt)
                 for k, v in det_terms.items():
                     losses[k.replace("loss_instance", "loss_det")] = v * cfg.detection_weight
 

@@ -135,3 +135,50 @@ class TestForwardBackward:
         grad2 = params["forecaster.instance_extractor.center_head.weight"].grad
         assert grad2 is not None
         assert torch.any(grad2 != 0)
+
+
+class TestBatchSizeGreaterThanOne:
+    """Regression: every loss term must work at B>1, not just the B=1 the other tests use.
+
+    `batch['gt_boxes']` is List[B][T_o] (batch-major). The present-frame detection
+    auxiliary in `DRIFT.loss` used to slice it as `gt_boxes[:1]` -- correct only when
+    B == 1, an IndexError for any larger batch. Since real training runs B>1 while every
+    test ran B=1, the bug was invisible. This locks the contract in.
+    """
+
+    def test_loss_at_batch_size_three(self):
+        import torch
+        from configs import get_config
+        from drift.data.cam4docc_dataset import SyntheticOccDataset
+        from drift.data.collate import collate_fn
+        from drift.models.drift import DRIFT
+
+        cfg = get_config("tiny")
+        m = cfg.model
+        # T_o != B so a batch/time mix-up cannot accidentally line up.
+        m.T_o, m.T_f = 5, 4
+        ds = SyntheticOccDataset(
+            num_samples=3, T_p=m.T_p, T_f=m.T_f, T_o=m.T_o, N_cam=m.N_cam,
+            num_classes=m.num_classes, latent_size=m.latent_size, occ_size=m.occ_size,
+            H_img=cfg.data.H_img, W_img=cfg.data.W_img,
+            num_points_range=cfg.data.num_points_range, num_boxes_range=(1, 3),
+        )
+        batch = collate_fn([ds[0], ds[1], ds[2]])
+        assert len(batch["gt_boxes"]) == 3, "gt_boxes must be batch-major: List[B][T_o]"
+        assert len(batch["gt_boxes"][0]) == m.T_o
+
+        model = DRIFT(m, cfg.loss)
+        outputs = model(batch)
+        losses = model.loss(outputs, batch)
+
+        assert "loss_det_cls" in losses, "present-frame detection auxiliary must be computed"
+        for name, value in losses.items():
+            assert value.ndim == 0, f"{name} must be a scalar, got {tuple(value.shape)}"
+            assert torch.isfinite(value), f"{name} is not finite: {value}"
+
+        total = sum(losses.values())
+        total.backward()
+        assert any(
+            p.grad is not None and torch.isfinite(p.grad).all()
+            for p in model.parameters() if p.requires_grad
+        ), "backward at B>1 produced no finite gradients"

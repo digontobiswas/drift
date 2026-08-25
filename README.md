@@ -64,7 +64,7 @@ python -m pip install fvcore   # optional, for a FLOPs count in tools/benchmark_
 Requires Python 3.10+, PyTorch 2.x. Verify the install:
 
 ```bash
-python -m pytest tests/ -q   # 35 passed
+python -m pytest tests/ -q   # 48 passed
 ```
 
 ## 2. Data prep
@@ -75,18 +75,55 @@ Two datasets share the exact same sample contract (`docs/DESIGN_SPEC.md` §4):
   semantically-plausible samples on the fly, no external data or download required. This is
   what every command below uses by default (`--dataset synthetic`, the default for the `tiny`
   config) and what every module in this repo has actually been exercised against.
-- **`Cam4DOccDataset`** reads a pre-processed, protocol-compatible archive: a JSON `ann_file`
-  indexing per-sample `.npz` files (camera/LiDAR/ego-motion/GT) plus raw `.bin` point-cloud
-  files. The on-disk schema is documented in full in that class's docstring. Producing this
-  archive from a raw nuScenes + Cam4DOcc download is an **offline preprocessing step outside
-  this repo's scope** — see [Known limitations](#5-known-limitations) below for the honest
-  status of this path (implemented against the documented protocol, not yet run against a
-  real download).
+- **`Cam4DOccDataset`** reads the derived, protocol-compatible dataset built by
+  **`tools/prepare_nuscenes.py`** from a raw nuScenes download: a JSON `ann_file` indexing
+  per-sample `.npz` files (calibration, ego-motion, sparse occupancy/instance GT, latent-
+  resolution flow). Images and point clouds are *not* copied — the index stores paths back
+  into the read-only nuScenes tree and the dataset decodes them lazily, which keeps the
+  derived dataset around 12 MB per sample instead of ~500 MB.
+
+### Building the derived dataset from raw nuScenes
+
+```bash
+python tools/prepare_nuscenes.py \
+    --nuscenes-root /path/to/nuscenes-trainval \   # read-only source
+    --out-root      /path/to/derived \             # new, writable; must be outside the source
+    --split val --protocol gmo
+```
+
+`--protocol gmo` is the Cam4DOcc benchmark protocol: 3 classes (0 free, 1 general static
+occupancy, 2 general movable object). It needs only the base `v1.0-trainval` archives — no
+separate nuScenes-lidarseg download. Use the `cam4docc_gmo` preset with it.
+
+The script is **resumable** (existing `.npz` files are skipped), shardable across a job array
+(`--shard` / `--num-shards`, merged afterwards with `tools/merge_shards.py`), and refuses to
+write anywhere inside `--nuscenes-root`.
 
 To point any tool at real data instead of synthetic:
 
 ```bash
---dataset cam4docc --data-root /path/to/cam4docc_preprocessed --ann-file train.json  # or val.json
+--dataset cam4docc --data-root /path/to/derived --ann-file drift_train.json  # or drift_val.json
+```
+
+Or set `DRIFT_DATA_ROOT` / `DRIFT_ANN_FILE` / `DRIFT_CKPT_DIR` once in the environment and
+every preset picks them up — this is how the Slurm scripts drive the whole ablation grid
+without editing a config file.
+
+### Running on an HPC cluster
+
+**[`docs/HPC_GUIDE.md`](docs/HPC_GUIDE.md)** is the end-to-end runbook: environment setup
+(including the no-`ssl`-module and no-internet-on-compute-nodes cases), preprocessing as a
+job array, a 10-minute smoke test that catches the failures which otherwise surface six hours
+into a 24-hour run, the full ablation grid, and result collection.
+
+```bash
+bash scripts/setup_env.sh          # login node: venv + dependencies
+bash scripts/fetch_weights.sh      # login node: pretrained weights (compute nodes are offline)
+sbatch --export=ALL,SPLIT=val slurm/00_preprocess.slurm
+sbatch slurm/01_smoke.slurm        # verify before committing GPU-days
+sbatch slurm/03_ablations.slurm    # all 7 configs
+sbatch slurm/04_eval.slurm
+python tools/collect_results.py --results-dir $DRIFT_RESULTS_DIR --out results.md
 ```
 
 ## 3. Commands
@@ -205,7 +242,7 @@ Robustness (fill in from `tools/run_robustness.py --config cam4docc_2s ...`):
 ## 5. Known limitations
 
 This implementation pass verified every module against `tiny` config + `SyntheticOccDataset`
-on CPU (no GPU, no real nuScenes data were available in this environment): 35 unit/integration
+on CPU (no GPU, no real nuScenes data were available in this environment): 48 unit/integration
 tests pass, and `tools/train.py`, `tools/eval.py`, `tools/benchmark_latency.py`, and
 `tools/run_robustness.py` all run end-to-end producing real numbers on synthetic data. The
 following are honest, known gaps rather than bugs — read before citing any number this repo
@@ -228,15 +265,19 @@ produces:
    should import the canonical implementation instead of maintaining a second one that could
    silently drift out of sync with it.
 
-3. **The real-nuScenes data path is implemented but unvalidated.** `drift/data/cam4docc_dataset.py`'s
-   `Cam4DOccDataset` is implemented faithfully against the documented Cam4DOcc-protocol
-   on-disk schema (see its class docstring for the exact `.npz`/`.bin` contract), and produces
-   samples in the exact shape/dtype contract every other module expects. It has **only ever
-   been exercised against `SyntheticOccDataset`** in this repo — no real nuScenes download or
-   Cam4DOcc preprocessing run has been available to validate it end-to-end (wrong axis order
-   in a real preprocessing script, an edge case in real box/track data, etc. would not have
-   been caught). Treat it as "implemented, needs validation against a real download" rather
-   than "verified."
+3. **The real-nuScenes path is now built, but has still never seen a real download.**
+   `tools/prepare_nuscenes.py` builds the derived dataset from raw nuScenes, and
+   `Cam4DOccDataset` reads it. Both halves are exercised in CI: `tests/test_preprocessing.py`
+   pins the geometry (quaternion convention, oriented-box rasterization against analytic
+   volume, sparse encode/decode round-trip through the dataset's own decoder), and the loader
+   has been driven end-to-end through `train.py` and `eval.py` on fabricated files written in
+   exactly the on-disk format the preprocessing script emits. What has **not** happened is a
+   run against an actual nuScenes download — so anything that depends on real metadata
+   (category coverage, `box_velocity` edge cases, scenes with unusual sensor timing) is still
+   unvalidated. `slurm/01_smoke.slurm` exists precisely to surface that class of problem in
+   ten minutes rather than six hours into a training run; read its class-balance output before
+   trusting anything downstream.
+
 
 4. **LSS splatting uses `scatter_add_`, not the optimized CUDA `bev_pool`.**
    `drift/models/encoders/camera_encoder.py`'s depth-splat lift is implemented with a plain,
@@ -250,6 +291,15 @@ produces:
    directly measurable from its output today.
 
 ### Other notes from this implementation pass
+
+- A second, more serious bug surfaced only once the loader ran at batch size > 1:
+  `DRIFT.loss` sliced `batch['gt_boxes'][:1]` for the present-frame detection auxiliary.
+  `gt_boxes` is `List[B][T_o]` — batch-major — so that expression sliced the *batch* down to
+  one element while `instance_loss` still looped over all `B` states, raising `IndexError` for
+  every batch size above 1. Every test in the suite ran `B=1`, where the two slicings happen to
+  coincide, so it stayed invisible until the cam4docc loader was driven at `B=2`. Fixed to
+  `[boxes[:1] for boxes in gt_boxes]`, with `tests/test_forward_backward.py::TestBatchSizeGreaterThanOne`
+  (which deliberately uses `T_o != B`) pinning the contract so it cannot regress.
 
 - `tools/train.py` had one small, now-fixed bug: `--max-iters N` (the exact pattern used in
   that script's own docstring example, and in every smoke-test command in this README) stopped

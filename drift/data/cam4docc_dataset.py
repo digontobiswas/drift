@@ -105,43 +105,62 @@ def _build_future_ego(ego_motion: Tensor, present_idx: int, num_future: int) -> 
     return compose_future_transforms(ego_motion.unsqueeze(0), present_idx, num_future).squeeze(0)
 
 
+# ImageNet statistics, applied to lazily-loaded JPEGs so that a `pretrained=True`
+# ResNet backbone sees the distribution it was trained on.
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+# nuScenes camera images are 1600x900. The default here is the standard BEVDet /
+# Cam4DOcc input crop: resize by 0.44 then crop the top away (the sky carries no
+# occupancy information and the crop keeps the road surface).
+NUSC_IMG_HW = (900, 1600)
+
+
 class Cam4DOccDataset(Dataset):
     """Protocol-compatible dataset reading pre-processed Cam4DOcc-style samples.
 
-    On-disk contract (produced by an offline preprocessing script, not part of
-    this module): `ann_file` is a JSON list of per-sample entries, each
+    On-disk contract, produced by ``tools/prepare_nuscenes.py``: ``ann_file`` is
+    a JSON list of per-sample entries, each
 
     ```json
     {
-      "npz_path": "relative/or/absolute/path/to/sample.npz",
-      "points_paths": ["frame0.bin", "frame1.bin", ...]   // length T_p, each (N_i,4) float32
+      "sample_token": "...",
+      "npz_path":   "samples/<token>.npz",
+      "points_paths": ["<abs>/LIDAR_TOP/....pcd.bin", ...],      // length T_p
+      "img_paths":  [["<abs>/CAM_FRONT/....jpg", ... x6], ...]   // (T_p, N_cam)
     }
     ```
 
-    `npz_path` points to an `np.savez` archive with keys:
-      - `imgs`: `(T_p,N_cam,3,H,W)` float32 (already normalized)
-      - `rots`,`trans`,`intrins`,`post_rots`,`post_trans`: per `CameraParams`,
-        each `(T_p,N_cam,...)`
-      - `ego_motion`: `(T_seq,4,4)` float32, `ego_motion[t] = T_{t+1<-t}`
-      - `gt_occ`: `(T_o,512,512,40)` int64
-      - `gt_flow`: `(T_o,3,128,128,10)` float32
-      - `gt_instance`: `(T_o,512,512,40)` int64
-      - `lidar_mask`, `cam_mask`: `(T_p,)` float32
-      - `box_center`,`box_size`,`box_yaw`,`box_velocity`,`box_label`,`box_track_id`:
-        object arrays of length `T_o`, each element the per-frame `(N_t, ...)`
-        arrays for that field (`N_t` varies per frame).
+    Point clouds and images are **not** copied into the derived dataset -- the
+    paths point back into the read-only raw nuScenes tree and are decoded lazily
+    here. Only ground truth and calibration live in the ``.npz``.
 
-    `points_paths[t]` are raw `.bin` files of `float32` points, `(N_i,
-    in_channels)`, one per past/present frame, loaded lazily at `__getitem__`
-    time (kept out of the `.npz` since point clouds dominate storage size).
+    Two ``.npz`` layouts are accepted:
+
+    *Sparse* (what ``tools/prepare_nuscenes.py`` writes; ~12 MB/sample):
+      ``sparse_coords`` ``(M,3)`` int16, ``sparse_occ`` ``(M,)`` uint8,
+      ``sparse_instance`` ``(M,)`` uint16, ``sparse_counts`` ``(T_o,)`` int64,
+      plus ``occ_size``/``latent_size``. Free voxels are omitted entirely.
+
+    *Dense* (legacy / externally produced): ``gt_occ`` ``(T_o,X,Y,Z)`` int64,
+      ``gt_instance`` same shape, ``gt_flow`` ``(T_o,3,x,y,z)`` float32.
+
+    Both layouts additionally carry ``rots``/``trans``/``intrins``
+    ``(T_p,N_cam,...)``, ``ego_motion`` ``(T_seq,4,4)``, ``lidar_mask`` /
+    ``cam_mask`` ``(T_p,)``, and the per-frame ``box_*`` object arrays.
+    ``post_rots``/``post_trans`` are derived from the image resize/crop applied
+    here (or read from the ``.npz`` if the preprocessing baked them in).
 
     Args:
-        data_root: Root directory that `points_paths` (if relative) and
-            `npz_path` (if relative) are resolved against.
+        data_root: Root the relative ``npz_path`` is resolved against.
         ann_file: Path to the JSON index described above.
-        present_idx: Index of the present frame within `T_p` (default `T_p - 1`,
-            inferred per-sample from the loaded `imgs` shape if left `None`).
-        in_channels: Point feature channels (xyz + intensity, etc.).
+        present_idx: Index of the present frame within ``T_p`` (default ``T_p-1``).
+        in_channels: Point feature channels kept from each ``.bin``.
+        img_hw: ``(H, W)`` the loaded images are resized/cropped to. Must match
+            ``DataConfig.H_img`` / ``W_img``.
+        point_dims_on_disk: Channels stored per point in the raw ``.bin``.
+            nuScenes LiDAR sweeps store 5 (x, y, z, intensity, ring index); the
+            first ``in_channels`` are kept.
     """
 
     def __init__(
@@ -150,6 +169,8 @@ class Cam4DOccDataset(Dataset):
         ann_file: str,
         present_idx: Optional[int] = None,
         in_channels: int = 4,
+        img_hw: Tuple[int, int] = (256, 704),
+        point_dims_on_disk: int = 5,
     ) -> None:
         self.data_root = Path(data_root)
         ann_path = Path(ann_file)
@@ -157,13 +178,17 @@ class Cam4DOccDataset(Dataset):
             ann_path = self.data_root / ann_path
         if not ann_path.exists():
             raise ValueError(
-                f"Cam4DOccDataset: annotation file not found: {ann_path}. Expected a JSON list "
-                "produced by the offline Cam4DOcc preprocessing script (see class docstring)."
+                f"Cam4DOccDataset: annotation file not found: {ann_path}. Build it first with\n"
+                f"  python tools/prepare_nuscenes.py --nuscenes-root <raw> --out-root {self.data_root} --split ..."
             )
         with open(ann_path, "r") as f:
             self._index: List[Dict[str, Any]] = json.load(f)
+        if not self._index:
+            raise ValueError(f"Cam4DOccDataset: annotation file {ann_path} is empty.")
         self.present_idx = present_idx
         self.in_channels = in_channels
+        self.img_hw = (int(img_hw[0]), int(img_hw[1]))
+        self.point_dims_on_disk = int(point_dims_on_disk)
 
     def __len__(self) -> int:
         return len(self._index)
@@ -172,61 +197,183 @@ class Cam4DOccDataset(Dataset):
         path = Path(p)
         return path if path.is_absolute() else self.data_root / path
 
+    # -- image loading ------------------------------------------------------
+
+    def _load_image(self, path: str) -> Tuple[Tensor, float, Tuple[int, int]]:
+        """Decode one JPEG -> `(3,H,W)` normalized tensor, plus its resize/crop params."""
+        try:
+            from PIL import Image
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "Pillow is required to load nuScenes camera images. Install it on the login node: "
+                "pip install Pillow"
+            ) from exc
+
+        H_out, W_out = self.img_hw
+        with Image.open(self._resolve(path)) as im:
+            im = im.convert("RGB")
+            W_src, H_src = im.size
+            # Resize so width matches exactly, then crop the *top* off to height.
+            scale = W_out / W_src
+            H_res = int(round(H_src * scale))
+            im = im.resize((W_out, H_res), Image.BILINEAR)
+            crop_top = max(0, H_res - H_out)
+            im = im.crop((0, crop_top, W_out, crop_top + H_out))
+            arr = np.asarray(im, dtype=np.float32) / 255.0
+
+        arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
+        tensor = torch.from_numpy(np.ascontiguousarray(arr.transpose(2, 0, 1)))
+        return tensor, scale, (crop_top, 0)
+
+    @staticmethod
+    def _post_transform(scale: float, crop: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+        """The 3x3 / 3-vector image-plane augmentation `CameraParams` expects.
+
+        A pixel `u` in the *original* image maps to `post_rot @ u + post_trans`
+        in the loaded tensor, so the projection code can undo the resize/crop.
+        """
+        post_rot = np.eye(3, dtype=np.float32) * scale
+        post_rot[2, 2] = 1.0
+        crop_top, crop_left = crop
+        post_trans = np.array([-float(crop_left), -float(crop_top), 0.0], dtype=np.float32)
+        return post_rot, post_trans
+
+    # -- ground-truth decoding ---------------------------------------------
+
+    @staticmethod
+    def _decode_sparse(npz: Any) -> Tuple[Tensor, Tensor]:
+        """Sparse `(coords, occ, instance, counts)` -> dense `(T_o,X,Y,Z)` occ / instance."""
+        occ_size = tuple(int(v) for v in npz["occ_size"])
+        counts = np.asarray(npz["sparse_counts"], dtype=np.int64)
+        coords = np.asarray(npz["sparse_coords"], dtype=np.int64)
+        vals_occ = np.asarray(npz["sparse_occ"], dtype=np.int64)
+        vals_inst = np.asarray(npz["sparse_instance"], dtype=np.int64)
+
+        T_o = int(counts.shape[0])
+        occ = torch.zeros((T_o, *occ_size), dtype=torch.long)
+        inst = torch.zeros((T_o, *occ_size), dtype=torch.long)
+        offset = 0
+        for t in range(T_o):
+            n = int(counts[t])
+            if n == 0:
+                continue
+            c = coords[offset : offset + n]
+            occ[t, c[:, 0], c[:, 1], c[:, 2]] = torch.from_numpy(vals_occ[offset : offset + n])
+            inst[t, c[:, 0], c[:, 1], c[:, 2]] = torch.from_numpy(vals_inst[offset : offset + n])
+            offset += n
+        return occ, inst
+
+    @staticmethod
+    def _decode_boxes(npz: Any, T_o: int) -> List[BoxSet]:
+        gt_boxes: List[BoxSet] = []
+        centers, sizes, yaws, vels, labels, tids = (
+            npz["box_center"], npz["box_size"], npz["box_yaw"],
+            npz["box_velocity"], npz["box_label"], npz["box_track_id"],
+        )
+        for t in range(T_o):
+            c = np.asarray(centers[t], dtype=np.float32).reshape(-1, 3)
+            if c.shape[0] == 0:
+                gt_boxes.append(BoxSet.empty())
+                continue
+            gt_boxes.append(
+                BoxSet(
+                    center=torch.from_numpy(c),
+                    size=torch.from_numpy(np.asarray(sizes[t], dtype=np.float32).reshape(-1, 3)),
+                    yaw=torch.from_numpy(np.asarray(yaws[t], dtype=np.float32).reshape(-1, 1)),
+                    velocity=torch.from_numpy(np.asarray(vels[t], dtype=np.float32).reshape(-1, 3)),
+                    label=torch.from_numpy(np.asarray(labels[t], dtype=np.int64).reshape(-1)),
+                    track_id=torch.from_numpy(np.asarray(tids[t], dtype=np.int64).reshape(-1)),
+                )
+            )
+        return gt_boxes
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         entry = self._index[idx]
         npz_path = self._resolve(entry["npz_path"])
         if not npz_path.exists():
             raise ValueError(
-                f"Cam4DOccDataset[{idx}]: missing pre-processed file {npz_path}. This dataset "
-                "only loads already-preprocessed Cam4DOcc archives; run the offline preprocessing "
-                "script first."
+                f"Cam4DOccDataset[{idx}]: missing pre-processed file {npz_path}. Run "
+                "tools/prepare_nuscenes.py first (it is resumable, so a partial run can be continued)."
             )
-        with np.load(npz_path, allow_pickle=True) as npz:
-            imgs = torch.from_numpy(npz["imgs"]).float()
-            T_p, N_cam = imgs.shape[0], imgs.shape[1]
-            present_idx = self.present_idx if self.present_idx is not None else T_p - 1
 
-            cam_params = {
-                "rots": torch.from_numpy(npz["rots"]).float(),
-                "trans": torch.from_numpy(npz["trans"]).float(),
-                "intrins": torch.from_numpy(npz["intrins"]).float(),
-                "post_rots": torch.from_numpy(npz["post_rots"]).float(),
-                "post_trans": torch.from_numpy(npz["post_trans"]).float(),
-            }
+        with np.load(npz_path, allow_pickle=True) as npz:
+            keys = set(npz.files)
 
             ego_motion = torch.from_numpy(npz["ego_motion"]).float()
-            gt_occ = torch.from_numpy(npz["gt_occ"]).long()
-            gt_flow = torch.from_numpy(npz["gt_flow"]).float()
-            gt_instance = torch.from_numpy(npz["gt_instance"]).long()
+            gt_flow = torch.from_numpy(np.asarray(npz["gt_flow"], dtype=np.float32)).float()
             lidar_mask = torch.from_numpy(npz["lidar_mask"]).float()
             cam_mask = torch.from_numpy(npz["cam_mask"]).float()
+
+            if "sparse_counts" in keys:
+                gt_occ, gt_instance = self._decode_sparse(npz)
+            else:
+                gt_occ = torch.from_numpy(npz["gt_occ"]).long()
+                gt_instance = torch.from_numpy(npz["gt_instance"]).long()
             T_o = gt_occ.shape[0]
 
-            gt_boxes: List[BoxSet] = []
-            centers, sizes, yaws, vels, labels, tids = (
-                npz["box_center"], npz["box_size"], npz["box_yaw"],
-                npz["box_velocity"], npz["box_label"], npz["box_track_id"],
-            )
-            for t in range(T_o):
-                c = np.asarray(centers[t], dtype=np.float32).reshape(-1, 3)
-                if c.shape[0] == 0:
-                    gt_boxes.append(BoxSet.empty())
-                    continue
-                gt_boxes.append(
-                    BoxSet(
-                        center=torch.from_numpy(c),
-                        size=torch.from_numpy(np.asarray(sizes[t], dtype=np.float32).reshape(-1, 3)),
-                        yaw=torch.from_numpy(np.asarray(yaws[t], dtype=np.float32).reshape(-1, 1)),
-                        velocity=torch.from_numpy(np.asarray(vels[t], dtype=np.float32).reshape(-1, 3)),
-                        label=torch.from_numpy(np.asarray(labels[t], dtype=np.int64).reshape(-1)),
-                        track_id=torch.from_numpy(np.asarray(tids[t], dtype=np.int64).reshape(-1)),
-                    )
+            rots = torch.from_numpy(npz["rots"]).float()
+            trans = torch.from_numpy(npz["trans"]).float()
+            intrins = torch.from_numpy(npz["intrins"]).float()
+            baked_post = "post_rots" in keys and "post_trans" in keys
+            if baked_post:
+                post_rots = torch.from_numpy(npz["post_rots"]).float()
+                post_trans = torch.from_numpy(npz["post_trans"]).float()
+
+            gt_boxes = self._decode_boxes(npz, T_o)
+
+            # Images: either baked into the .npz (legacy) or lazily decoded from JPEG.
+            if "imgs" in keys:
+                imgs = torch.from_numpy(npz["imgs"]).float()
+                if not baked_post:
+                    T_p_, N_ = imgs.shape[0], imgs.shape[1]
+                    post_rots = torch.eye(3).expand(T_p_, N_, 3, 3).clone()
+                    post_trans = torch.zeros(T_p_, N_, 3)
+                imgs_from_disk = False
+            else:
+                imgs_from_disk = True
+
+        if imgs_from_disk:
+            if "img_paths" not in entry:
+                raise ValueError(
+                    f"Cam4DOccDataset[{idx}]: {npz_path} has no 'imgs' array and the annotation "
+                    "entry has no 'img_paths'. Rebuild the index with tools/prepare_nuscenes.py."
                 )
+            frames, pr_frames, pt_frames = [], [], []
+            for cam_paths in entry["img_paths"]:
+                views, prs, pts_ = [], [], []
+                for p in cam_paths:
+                    img, scale, crop = self._load_image(p)
+                    pr, pt = self._post_transform(scale, crop)
+                    views.append(img)
+                    prs.append(torch.from_numpy(pr))
+                    pts_.append(torch.from_numpy(pt))
+                frames.append(torch.stack(views))
+                pr_frames.append(torch.stack(prs))
+                pt_frames.append(torch.stack(pts_))
+            imgs = torch.stack(frames)          # (T_p, N_cam, 3, H, W)
+            post_rots = torch.stack(pr_frames)  # (T_p, N_cam, 3, 3)
+            post_trans = torch.stack(pt_frames)  # (T_p, N_cam, 3)
+
+        cam_params = {
+            "rots": rots,
+            "trans": trans,
+            "intrins": intrins,
+            "post_rots": post_rots,
+            "post_trans": post_trans,
+        }
+
+        T_p = imgs.shape[0]
+        present_idx = self.present_idx if self.present_idx is not None else T_p - 1
 
         points: List[Tensor] = []
         for p in entry["points_paths"]:
-            arr = np.fromfile(self._resolve(p), dtype=np.float32).reshape(-1, self.in_channels)
-            points.append(torch.from_numpy(arr))
+            arr = np.fromfile(self._resolve(p), dtype=np.float32)
+            d = self.point_dims_on_disk
+            if arr.size % d != 0:
+                # Fall back to in_channels for .bin files written by other pipelines.
+                d = self.in_channels
+            arr = arr.reshape(-1, d)[:, : self.in_channels]
+            points.append(torch.from_numpy(np.ascontiguousarray(arr)))
 
         future_ego = _build_future_ego(ego_motion, present_idx, T_o)
 

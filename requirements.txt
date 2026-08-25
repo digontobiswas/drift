@@ -1,5 +1,21 @@
+# Core. Install torch/torchvision from the CUDA index rather than plain PyPI --
+# scripts/setup_env.sh does this for you:
+#   pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision
 torch>=2.1
 torchvision>=0.16
-numpy>=1.24
+
+# numpy is capped below 2.0 deliberately: nuscenes-devkit and parts of its
+# dependency tree still use APIs removed in numpy 2.x (and the `np.bool` /
+# `np.int` aliases removed back in 1.24).
+numpy>=1.24,<2.0
 scipy>=1.10
+
+# Image decoding for the lazily-loaded nuScenes camera frames.
+Pillow>=10.0
+
+# Raw nuScenes -> Cam4DOcc preprocessing (tools/prepare_nuscenes.py) only.
+# Nothing in drift/ imports it, so a training-only environment can drop it.
+nuscenes-devkit>=1.1.11
+
+# Tests
 pytest>=7.4
