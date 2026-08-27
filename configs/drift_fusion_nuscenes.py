@@ -90,11 +90,30 @@ def cam4docc_gmo() -> DriftConfig:
     # larger card. Every ablation preset inherits this, so the grid stays comparable.
     m.grad_checkpoint = True
 
+    # Latent width, halved from the 128 of the design spec. This is the single knob
+    # that sets the size of every dense 5D volume in the model -- at 128 each one is
+    # ~500 MB at T_o=6, and two 16 GB V100s under DDP could not hold a step even with
+    # checkpointing (DDP adds a full gradient bucket per rank on top of activations).
+    # 64 also roughly halves step time, which is what makes the ablation grid fit the
+    # cluster at all: at 128 one config was ~8.8 days of 2-GPU time, ~62 GPU-days for
+    # the 7-config grid, against a 3-day-per-job partition limit.
+    #
+    # This is a capacity reduction, not a free win -- absolute IoU will be lower than
+    # a 128-wide model would reach. It is set HERE, on the shared base preset, so all
+    # seven ablations inherit it and the comparison between them stays apples-to-apples,
+    # which is what the ablation table actually claims.
+    m.fusion.embed_dims = 64
+
     d = cfg.data
     d.dataset = "cam4docc"
     d.H_img, d.W_img = 256, 704
     d.batch_size = 1  # per GPU; raise if memory allows
     d.num_workers = 4
+
+    # 12 rather than 24 epochs, for the schedule reasons above. The cosine LR schedule
+    # is defined over total_steps, so it anneals correctly across whatever horizon is
+    # set -- this shortens training rather than truncating a 24-epoch schedule midway.
+    cfg.train.epochs = 12
 
     # 3 classes are heavily imbalanced: free >> GSO >> GMO. Weight the two
     # occupied classes up so the GMO IoU the benchmark reports is not drowned out.

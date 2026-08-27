@@ -2,7 +2,7 @@
 #SBATCH --job-name=drift_train
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
-#SBATCH --time=24:00:00
+#SBATCH --time=72:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:2
@@ -23,7 +23,7 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 source slurm/env.sh
 
 CONFIG="${CONFIG:-cam4docc_gmo}"
-EPOCHS="${EPOCHS:-24}"
+EPOCHS="${EPOCHS:-12}"
 BATCH_SIZE="${BATCH_SIZE:-1}"       # per GPU
 NGPU="${NGPU:-$(python -c 'import torch; print(torch.cuda.device_count())')}"
 

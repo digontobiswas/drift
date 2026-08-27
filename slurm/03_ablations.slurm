@@ -2,7 +2,7 @@
 #SBATCH --job-name=drift_abl
 #SBATCH --output=logs/abl_%A_%a.out
 #SBATCH --error=logs/abl_%A_%a.err
-#SBATCH --time=24:00:00
+#SBATCH --time=72:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:2
@@ -34,7 +34,7 @@ CONFIGS=(
 )
 CONFIG="${CONFIGS[${SLURM_ARRAY_TASK_ID:-0}]}"
 
-EPOCHS="${EPOCHS:-24}"
+EPOCHS="${EPOCHS:-12}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 NGPU="$(python -c 'import torch; print(torch.cuda.device_count())')"
 

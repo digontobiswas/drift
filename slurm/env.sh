@@ -71,12 +71,16 @@ export LD_LIBRARY_PATH="${DRIFT_EXTRA_LD_PATH:-}${DRIFT_EXTRA_LD_PATH:+:}${LD_LI
 export PYTHONUNBUFFERED=1                  # so .out logs stream instead of buffering
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 
-# The gpu partition's V100s have 16 GiB, and this model runs close to that ceiling
-# even at batch_size=1. Allocating the forecaster's gate-concat repeatedly against
-# a fragmented caching allocator wasted ~850 MiB of reserved-but-unallocated blocks
-# and turned a fit into an OOM. expandable_segments lets the allocator grow existing
-# segments instead of stranding them at fixed sizes.
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# The gpu partition's V100s have 16 GiB and this model runs near that ceiling even at
+# batch_size=1, so allocator fragmentation matters.
+#
+# NOT expandable_segments: this platform's CUDA build rejects it outright --
+#   "Warning: expandable_segments not supported on this platform"
+# -- so setting it did nothing at all while appearing to help. max_split_size_mb is
+# the fallback that does work here: it stops the allocator from carving large free
+# blocks into small ones it can never recombine, which is the fragmentation mode that
+# bites when a few ~500 MB volumes are allocated and freed every iteration.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:256}"
 export HF_HUB_OFFLINE=1                    # never attempt a network fetch on a compute node
 export TORCH_HUB_OFFLINE=1
 export PYTHONPATH="$DRIFT_REPO:${PYTHONPATH:-}"
