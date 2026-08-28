@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=drift_prep
+#SBATCH --partition=shared
 #SBATCH --output=logs/prep_%A_%a.out
 #SBATCH --error=logs/prep_%A_%a.err
 #SBATCH --time=12:00:00

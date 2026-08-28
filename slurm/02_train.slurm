@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=drift_train
+#SBATCH --partition=gpu
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
 #SBATCH --time=72:00:00

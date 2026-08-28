@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=drift_robust
+#SBATCH --partition=gpu
 #SBATCH --output=logs/robust_%j.out
 #SBATCH --error=logs/robust_%j.err
 #SBATCH --time=06:00:00

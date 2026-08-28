@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=drift_eval
+#SBATCH --partition=gpu
 #SBATCH --output=logs/eval_%A_%a.out
 #SBATCH --error=logs/eval_%A_%a.err
 #SBATCH --time=04:00:00

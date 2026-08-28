@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=drift_smoke
+#SBATCH --partition=gpu
 #SBATCH --output=logs/smoke_%j.out
 #SBATCH --error=logs/smoke_%j.err
 #SBATCH --time=00:30:00
