@@ -9,6 +9,7 @@
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
+#SBATCH --signal=USR1@600
 #SBATCH --array=0-6
 #
 # The full ablation grid from docs/PROBLEM_STATEMENT_AND_EXPERIMENTS.md §8:
@@ -45,11 +46,16 @@ CKPT="$DRIFT_CKPT_DIR/$CONFIG/latest.pth"
 RESUME_ARG=()
 [[ -f "$CKPT" ]] && RESUME_ARG=(--resume "$CKPT") && echo "[abl] auto-resuming from $CKPT"
 
+# Baseline for the requeue decision below: "made progress" vs "died immediately".
+read -r START_EPOCH START_STEP < <(python tools/ckpt_info.py "$CKPT")
+echo "[abl] starting from epoch=$START_EPOCH step=$START_STEP"
+
 LAUNCH=(python tools/train.py)
 if [[ "$NGPU" -gt 1 ]]; then
     LAUNCH=(torchrun --standalone --nproc_per_node="$NGPU" tools/train.py --distributed)
 fi
 
+TRAIN_RC=0
 "${LAUNCH[@]}" \
     --config "$CONFIG" \
     --epochs "$EPOCHS" \
@@ -57,7 +63,28 @@ fi
     --num-workers "$(( ${SLURM_CPUS_PER_TASK:-8} / NGPU ))" \
     --device cuda \
     --log-interval 50 \
-    "${RESUME_ARG[@]}"
+    "${RESUME_ARG[@]}" || TRAIN_RC=$?
 
-echo "[abl] $CONFIG done -> $DRIFT_CKPT_DIR/$CONFIG"
+echo "[abl] $CONFIG exited with status $TRAIN_RC -> $DRIFT_CKPT_DIR/$CONFIG"
+
+# --- self-requeue, per array task -------------------------------------------
+# Each config resubmits ONLY ITSELF (--array=<this task>), so one config needing a
+# fourth 72-hour chunk does not restart the six that already finished.
+read -r END_EPOCH END_STEP < <(python tools/ckpt_info.py "$CKPT")
+echo "[abl] reached epoch=$END_EPOCH step=$END_STEP (target $EPOCHS epochs)"
+
+if [[ "${DRIFT_AUTO_REQUEUE:-1}" != "1" ]]; then
+    echo "[abl] auto-requeue disabled (DRIFT_AUTO_REQUEUE=$DRIFT_AUTO_REQUEUE)"
+elif [[ "$END_EPOCH" -ge "$EPOCHS" ]]; then
+    echo "[abl] $CONFIG complete -- all $EPOCHS epochs done"
+elif [[ "$END_STEP" -le "$START_STEP" ]]; then
+    echo "[abl] !! $CONFIG made no progress (step $START_STEP -> $END_STEP); NOT resubmitting." >&2
+    echo "[abl]    Inspect logs/abl_${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}.err" >&2
+else
+    echo "[abl] $CONFIG incomplete but progressing -- submitting follow-up for this task only"
+    sbatch --array="${SLURM_ARRAY_TASK_ID:-0}" \
+        --export=ALL,EPOCHS="$EPOCHS",BATCH_SIZE="$BATCH_SIZE" \
+        "${SLURM_SUBMIT_DIR:-$PWD}/slurm/03_ablations.slurm"
+fi
+
 echo "[abl] evaluate the whole grid afterwards with: sbatch slurm/04_eval.slurm"

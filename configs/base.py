@@ -286,6 +286,12 @@ class TrainConfig:
     grad_clip: float = 35.0
     log_interval: int = 10
     ckpt_dir: str = "work_dirs/drift"
+    # Save `latest.pth` every this many optimizer steps, in ADDITION to the
+    # epoch-end save. On real data an epoch is ~8 hours, so epoch-end-only saving
+    # means any mid-epoch crash (a segfault, a node failure, a walltime kill)
+    # throws away every hour of work since the epoch began. At ~2.6 s/step, 500
+    # steps caps that loss at roughly 20 minutes. Set 0 to disable.
+    ckpt_interval_steps: int = 500
     resume: Optional[str] = None
     seed: int = 0
     device: str = "cuda"

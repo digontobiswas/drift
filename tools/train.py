@@ -23,12 +23,56 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import math
 import os
+import signal
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+# Dump a Python traceback on a fatal native signal (SIGSEGV/SIGBUS/SIGFPE/SIGABRT).
+# A segfault inside a C extension -- torch, NCCL, PIL's JPEG decoder -- otherwise kills
+# the process with no Python-level information at all: torchrun reports only
+# "Signal 11 (SIGSEGV) received by PID ...", which says nothing about WHERE. With this
+# enabled the stack is written to stderr (the job's .err file) before the process dies.
+faulthandler.enable()
+
+
+# --- graceful shutdown on a walltime kill -----------------------------------
+#
+# The gpu partition caps a job at 72 hours but a full run needs ~4 days, so every
+# run WILL be interrupted at least once. Slurm announces this by sending a signal
+# (configured via `#SBATCH --signal=USR1@600`, i.e. 10 minutes before the hard
+# kill) and then SIGKILLs the job, which cannot be caught.
+#
+# Without a handler, everything since the last periodic checkpoint is lost. With
+# one, the loop notices the flag at the next step boundary, writes a checkpoint at
+# the exact position it reached, and exits cleanly -- so the follow-up job resumes
+# from there instead of from up to `ckpt_interval_steps` earlier.
+#
+# The flag is only *set* here; the actual save happens in the training loop, since
+# writing a checkpoint from inside a signal handler (mid-backward, mid-allreduce)
+# is exactly how a corrupt checkpoint gets produced.
+_STOP_REQUESTED = False
+
+
+def _request_stop(signum: int, _frame: Any) -> None:
+    global _STOP_REQUESTED
+    if not _STOP_REQUESTED:
+        _STOP_REQUESTED = True
+        print(
+            f"[train] signal {signum} received -- will checkpoint and exit at the next step boundary",
+            flush=True,
+        )
+
+
+for _sig in (signal.SIGUSR1, signal.SIGTERM):
+    try:
+        signal.signal(_sig, _request_stop)
+    except (ValueError, OSError):  # not on the main thread, or unsupported platform
+        pass
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -62,6 +106,10 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     p.add_argument("--ckpt-dir", type=str, default=None)
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--log-interval", type=int, default=None)
+    p.add_argument(
+        "--ckpt-interval-steps", type=int, default=None,
+        help="Save latest.pth every N optimizer steps (0 disables). Default from the config.",
+    )
     p.add_argument("--max-iters", type=int, default=None, help="Stop after this many optimizer steps (debug/CI).")
     p.add_argument("--distributed", action="store_true", default=False)
     return p.parse_args(argv)
@@ -95,6 +143,8 @@ def build_config(args: argparse.Namespace) -> DriftConfig:
         cfg.train.resume = args.resume
     if args.log_interval is not None:
         cfg.train.log_interval = args.log_interval
+    if args.ckpt_interval_steps is not None:
+        cfg.train.ckpt_interval_steps = args.ckpt_interval_steps
     if args.max_iters is not None:
         cfg.train.max_iters = args.max_iters
     cfg.train.distributed = args.distributed
@@ -233,31 +283,53 @@ def set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
 
 def save_checkpoint(
     path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
-    epoch: int, global_step: int, cfg: DriftConfig,
+    epoch: int, global_step: int, cfg: DriftConfig, batch_in_epoch: int = 0,
 ) -> None:
+    """Write a resumable checkpoint.
+
+    `epoch` is the epoch to RESUME AT, and `batch_in_epoch` how far into it this
+    snapshot is (0 = start of the epoch). An epoch-end save therefore passes
+    `epoch + 1` with `batch_in_epoch=0`; a mid-epoch save passes the current
+    `epoch` with the batch index, so resume re-enters the same epoch and fast-
+    forwards to where it left off instead of silently skipping the remainder.
+
+    The write goes to a temporary file first and is then atomically renamed.
+    Without that, a crash or walltime kill landing during `torch.save` leaves a
+    truncated `latest.pth` -- and since this is the file `03_ablations.slurm`
+    auto-resumes from, a corrupt one turns a recoverable interruption into a
+    dead run that fails instantly on every requeue.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+    tmp = path.with_name(path.name + ".tmp")
     torch.save(
         {
             "model": raw_model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
             "global_step": global_step,
+            "batch_in_epoch": batch_in_epoch,
             "config_name": cfg.name,
         },
-        path,
+        tmp,
     )
+    os.replace(tmp, path)
 
 
 def load_checkpoint(
     path: str, model: torch.nn.Module, optimizer: Optional[torch.optim.Optimizer], device: torch.device
-) -> "tuple[int, int]":
+) -> "tuple[int, int, int]":
+    """Returns `(epoch, global_step, batch_in_epoch)` to resume at.
+
+    `batch_in_epoch` is 0 for checkpoints written before it was recorded, which
+    makes an older checkpoint simply restart its epoch -- the previous behaviour.
+    """
     ckpt = torch.load(path, map_location=device)
     raw_model = model.module if isinstance(model, DistributedDataParallel) else model
     raw_model.load_state_dict(ckpt["model"])
     if optimizer is not None and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
-    return ckpt.get("epoch", 0), ckpt.get("global_step", 0)
+    return ckpt.get("epoch", 0), ckpt.get("global_step", 0), ckpt.get("batch_in_epoch", 0)
 
 
 def main(argv: Optional[list] = None) -> None:
@@ -310,11 +382,16 @@ def main(argv: Optional[list] = None) -> None:
     use_amp = cfg.train.amp and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-    start_epoch, global_step = 0, 0
+    start_epoch, global_step, resume_batch = 0, 0, 0
     if cfg.train.resume is not None:
-        start_epoch, global_step = load_checkpoint(cfg.train.resume, model, optimizer, device)
+        start_epoch, global_step, resume_batch = load_checkpoint(
+            cfg.train.resume, model, optimizer, device
+        )
         if is_main:
-            print(f"[train] resumed from {cfg.train.resume} at epoch={start_epoch} step={global_step}")
+            print(
+                f"[train] resumed from {cfg.train.resume} at epoch={start_epoch} "
+                f"step={global_step} batch_in_epoch={resume_batch}"
+            )
 
     ckpt_dir = Path(cfg.train.ckpt_dir)
 
@@ -331,12 +408,24 @@ def main(argv: Optional[list] = None) -> None:
         )
 
     stop = False
+    interrupted = False  # set when a walltime signal ends the run, vs. a clean finish
     for epoch in range(start_epoch, cfg.train.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
         model.train()
         t0 = time.time()
+        # Fast-forward when resuming into the middle of an epoch. Skipping still pays
+        # the dataloader cost but not the forward/backward, which is the overwhelming
+        # majority of a step -- so this recovers in minutes what would otherwise be
+        # hours of recomputation. `skip_batches` applies only to the epoch we resumed
+        # into; later epochs run whole.
+        skip_batches = resume_batch if epoch == start_epoch else 0
+        if skip_batches and is_main:
+            print(f"[train] fast-forwarding {skip_batches} batches into epoch {epoch}", flush=True)
+        it = -1  # defined even if the loader yields nothing, so the save below is safe
         for it, batch in enumerate(loader):
+            if it < skip_batches:
+                continue
             batch = move_batch_to_device(batch, device)
 
             current_lr = lr_at_step(cfg, global_step, total_steps)
@@ -370,18 +459,67 @@ def main(argv: Optional[list] = None) -> None:
                     flush=True,
                 )
 
+            # Periodic mid-epoch checkpoint. On real data an epoch is ~8 hours, so
+            # without this any crash between epoch boundaries discards everything since
+            # the last one -- exactly what a 3-hour SIGSEGV did on job 1153168, which
+            # left no checkpoint at all. Saved with the CURRENT epoch and batch index so
+            # resume re-enters this epoch and fast-forwards, rather than skipping ahead.
+            ckpt_every = getattr(cfg.train, "ckpt_interval_steps", 0)
+            if is_main and ckpt_every and global_step % ckpt_every == 0:
+                save_checkpoint(
+                    ckpt_dir / "latest.pth", model, optimizer, epoch, global_step, cfg,
+                    batch_in_epoch=it + 1,
+                )
+                print(
+                    f"[train] checkpoint saved at epoch={epoch} it={it} step={global_step}",
+                    flush=True,
+                )
+
             if cfg.train.max_iters is not None and global_step >= cfg.train.max_iters:
                 stop = True
                 break
-        # BUGFIX: a --max-iters stop used to `break` here *before* the epoch-end checkpoint
-        # save below, so a debug/CI run like `--max-iters 3` (the exact pattern in this
-        # script's own module docstring example) silently produced zero checkpoint files --
-        # defeating both the documented smoke-test use case and `--resume`. Save on every
-        # early stop too (still gated on `is_main`), then break.
+
+            # Walltime kill announced (see _request_stop). Leave the loop now so the
+            # save below records the exact position reached; every rank sees the same
+            # signal from Slurm, so they break together and DDP does not deadlock.
+            if _STOP_REQUESTED:
+                stop = True
+                interrupted = True
+                break
+        # An early `break` (--max-iters, or a walltime signal) means the epoch did NOT
+        # finish. Recording it as finished -- `epoch + 1, batch_in_epoch=0`, as an
+        # epoch-end save does -- would make the follow-up job skip every remaining batch
+        # of this epoch and silently train on less data than the config claims. So the
+        # two cases save different things:
+        #
+        #   completed   -> epoch + 1, batch_in_epoch=0   (resume starts the next epoch)
+        #   interrupted -> epoch,     batch_in_epoch=it+1 (resume re-enters and fast-forwards)
+        #
+        # A --max-iters stop still writes a checkpoint either way: an earlier bug had it
+        # `break` before any save, so the documented `--max-iters 3` smoke run produced no
+        # checkpoint files at all and `--resume` had nothing to load.
         if is_main:
-            save_checkpoint(ckpt_dir / f"epoch_{epoch}.pth", model, optimizer, epoch + 1, global_step, cfg)
-            save_checkpoint(ckpt_dir / "latest.pth", model, optimizer, epoch + 1, global_step, cfg)
-            print(f"[train] epoch {epoch} done in {time.time() - t0:.1f}s, checkpoint saved to {ckpt_dir}")
+            if interrupted or stop:
+                save_checkpoint(
+                    ckpt_dir / "latest.pth", model, optimizer, epoch, global_step, cfg,
+                    batch_in_epoch=it + 1,
+                )
+                reason = "interrupted by signal" if interrupted else "stopped at max_iters"
+                print(
+                    f"[train] {reason} at epoch={epoch} it={it} step={global_step}; "
+                    f"checkpoint saved to {ckpt_dir}/latest.pth",
+                    flush=True,
+                )
+            else:
+                save_checkpoint(
+                    ckpt_dir / f"epoch_{epoch}.pth", model, optimizer, epoch + 1, global_step, cfg,
+                    batch_in_epoch=0,
+                )
+                save_checkpoint(
+                    ckpt_dir / "latest.pth", model, optimizer, epoch + 1, global_step, cfg,
+                    batch_in_epoch=0,
+                )
+                print(f"[train] epoch {epoch} done in {time.time() - t0:.1f}s, checkpoint saved to {ckpt_dir}")
 
         if stop:
             break
