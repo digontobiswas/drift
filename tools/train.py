@@ -179,6 +179,46 @@ def build_dataset(cfg: DriftConfig):
     raise ValueError(f"Unknown dataset '{d.dataset}'.")
 
 
+def epoch_index_order(dataset, sampler, epoch: int, seed: int) -> "list[int]":
+    """The exact sequence of dataset indices this rank consumes during `epoch`.
+
+    Materialising the order is what makes a mid-epoch resume cheap. Asking the
+    DataLoader to shuffle internally leaves no way to re-enter an epoch part-way
+    except to iterate from the start and discard, which pays the full decode cost
+    of every skipped sample -- 11 minutes to skip 5000 batches, on real data, and
+    growing linearly the deeper into the epoch the crash happened. With the order
+    in hand the finished batches are simply dropped off the front.
+
+    The order must be reproducible across processes and across resumes of the same
+    epoch, or two ranks would disagree about who trains on what, and a resumed run
+    would revisit samples it had already seen while skipping others entirely.
+    `DistributedSampler` already guarantees that given `set_epoch`; the
+    single-process path seeds its own permutation to get the same guarantee, which
+    `shuffle=True` did not provide.
+    """
+    if sampler is not None:
+        sampler.set_epoch(epoch)
+        return list(sampler)
+    g = torch.Generator()
+    g.manual_seed(seed + epoch)
+    return torch.randperm(len(dataset), generator=g, dtype=torch.int64).tolist()
+
+
+def build_epoch_loader(
+    cfg: DriftConfig, dataset, order: "list[int]", skip_batches: int, drop_last: bool
+) -> DataLoader:
+    """A loader over the batches of `order` this epoch has not trained on yet.
+
+    Batch `i` of an epoch consumes `order[i * B : (i + 1) * B]`, so dropping the
+    first `skip_batches * B` indices resumes exactly where the checkpoint left off.
+    """
+    remaining = order[skip_batches * cfg.data.batch_size:]
+    return DataLoader(
+        dataset, batch_size=cfg.data.batch_size, sampler=remaining,
+        num_workers=cfg.data.num_workers, collate_fn=collate_fn, drop_last=drop_last,
+    )
+
+
 def _move(obj: Any, device: torch.device) -> Any:
     """Move one leaf to `device`. Tensors get `non_blocking`; other `.to()`-ables do not."""
     if torch.is_tensor(obj):
@@ -356,7 +396,11 @@ def main(argv: Optional[list] = None) -> None:
         DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
         if world_size > 1 else None
     )
-    loader = DataLoader(
+    # Measures a full epoch, for the LR schedule's total-step count. Training itself
+    # iterates a per-epoch loader built by `build_epoch_loader`, which can start
+    # part-way in; iterating THIS one would silently retrain batches a resumed run
+    # has already seen, so it is deliberately never used for anything but its length.
+    full_epoch_loader = DataLoader(
         dataset, batch_size=cfg.data.batch_size, shuffle=(sampler is None),
         sampler=sampler, num_workers=cfg.data.num_workers, collate_fn=collate_fn,
         drop_last=world_size > 1,
@@ -396,7 +440,7 @@ def main(argv: Optional[list] = None) -> None:
     ckpt_dir = Path(cfg.train.ckpt_dir)
 
     # Total planned steps, so the decay schedule lands exactly at the end of training.
-    steps_per_epoch = max(1, len(loader))
+    steps_per_epoch = max(1, len(full_epoch_loader))
     total_steps = steps_per_epoch * cfg.train.epochs
     if cfg.train.max_iters is not None:
         total_steps = min(total_steps, cfg.train.max_iters)
@@ -410,22 +454,29 @@ def main(argv: Optional[list] = None) -> None:
     stop = False
     interrupted = False  # set when a walltime signal ends the run, vs. a clean finish
     for epoch in range(start_epoch, cfg.train.epochs):
-        if sampler is not None:
-            sampler.set_epoch(epoch)
         model.train()
         t0 = time.time()
-        # Fast-forward when resuming into the middle of an epoch. Skipping still pays
-        # the dataloader cost but not the forward/backward, which is the overwhelming
-        # majority of a step -- so this recovers in minutes what would otherwise be
-        # hours of recomputation. `skip_batches` applies only to the epoch we resumed
-        # into; later epochs run whole.
+        # Re-enter a partially-trained epoch by starting the loader at the batch the
+        # checkpoint stopped on, rather than iterating from zero and discarding. The
+        # skipped batches are never constructed, so resuming costs no decode time at
+        # all. `skip_batches` applies only to the epoch we resumed into; later epochs
+        # run whole.
         skip_batches = resume_batch if epoch == start_epoch else 0
+        order = epoch_index_order(dataset, sampler, epoch, cfg.train.seed)
+        epoch_loader = build_epoch_loader(cfg, dataset, order, skip_batches, world_size > 1)
         if skip_batches and is_main:
-            print(f"[train] fast-forwarding {skip_batches} batches into epoch {epoch}", flush=True)
-        it = -1  # defined even if the loader yields nothing, so the save below is safe
-        for it, batch in enumerate(loader):
-            if it < skip_batches:
-                continue
+            print(
+                f"[train] resuming epoch {epoch} at batch {skip_batches} "
+                f"({len(epoch_loader)} batches left)",
+                flush=True,
+            )
+        # `it` counts batches from the start of the epoch, not from the start of this
+        # run, because it is what gets written as `batch_in_epoch`. Pre-set so that
+        # `it + 1` still names the resume point if the loader yields nothing at all --
+        # which is what an epoch that was already finished looks like.
+        it = skip_batches - 1
+        for local_it, batch in enumerate(epoch_loader):
+            it = skip_batches + local_it
             batch = move_batch_to_device(batch, device)
 
             current_lr = lr_at_step(cfg, global_step, total_steps)

@@ -23,7 +23,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 
 from configs import get_config
-from tools.train import load_checkpoint, save_checkpoint
+from tools.train import (
+    build_dataset,
+    build_epoch_loader,
+    epoch_index_order,
+    load_checkpoint,
+    save_checkpoint,
+)
 
 
 class _Tiny(torch.nn.Module):
@@ -111,6 +117,44 @@ class TestCheckpointResume:
             f"early stop recorded epoch={ckpt['epoch']}; resume would skip the rest of epoch 0"
         )
         assert ckpt["batch_in_epoch"] == 4, ckpt
+
+    def test_resume_trains_on_exactly_the_batches_that_were_missed(self) -> None:
+        """Resuming at batch k must cover the tail of the epoch and only the tail.
+
+        Skipping used to be safe by construction: iterate everything, `continue`
+        past the first k. Slicing the index list instead is what makes resume cheap,
+        but it moves the correctness onto arithmetic -- an off-by-one in the
+        `k * batch_size` offset would silently retrain or silently drop a batch, and
+        nothing downstream would notice. So pin the invariant directly: prefix plus
+        resumed tail reconstructs the epoch exactly, with no repeat and no gap.
+        """
+        cfg = get_config("tiny")
+        dataset = build_dataset(cfg)
+        batch_size = cfg.data.batch_size
+        order = epoch_index_order(dataset, None, epoch=3, seed=cfg.train.seed)
+
+        assert sorted(order) == list(range(len(dataset))), "epoch must visit every sample once"
+
+        full = build_epoch_loader(cfg, dataset, order, 0, drop_last=False)
+        k = len(full) // 2
+        assert k > 0, "test needs an epoch of at least two batches to split"
+        resumed = build_epoch_loader(cfg, dataset, order, k, drop_last=False)
+
+        assert len(resumed) == len(full) - k
+        assert order[: k * batch_size] + list(resumed.sampler) == order
+
+    def test_epoch_order_is_stable_across_resumes_but_varies_by_epoch(self) -> None:
+        """A resumed run recomputes the order rather than restoring it, so the same
+        epoch must shuffle the same way every time -- otherwise the tail it resumes
+        into belongs to a different permutation than the prefix it already trained
+        on, and samples get both repeated and skipped. Successive epochs must still
+        differ, or shuffling has quietly stopped happening."""
+        cfg = get_config("tiny")
+        dataset = build_dataset(cfg)
+        first = epoch_index_order(dataset, None, epoch=2, seed=cfg.train.seed)
+
+        assert epoch_index_order(dataset, None, epoch=2, seed=cfg.train.seed) == first
+        assert epoch_index_order(dataset, None, epoch=3, seed=cfg.train.seed) != first
 
     def test_overwrite_keeps_previous_checkpoint_loadable(self, tmp_path) -> None:
         """Re-saving over an existing latest.pth must not corrupt it -- periodic saves

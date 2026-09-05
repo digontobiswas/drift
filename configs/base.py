@@ -289,9 +289,16 @@ class TrainConfig:
     # Save `latest.pth` every this many optimizer steps, in ADDITION to the
     # epoch-end save. On real data an epoch is ~8 hours, so epoch-end-only saving
     # means any mid-epoch crash (a segfault, a node failure, a walltime kill)
-    # throws away every hour of work since the epoch began. At ~2.6 s/step, 500
-    # steps caps that loss at roughly 20 minutes. Set 0 to disable.
-    ckpt_interval_steps: int = 500
+    # throws away every hour of work since the epoch began. Set 0 to disable.
+    #
+    # At ~2.6 s/step, 200 steps caps that loss at roughly 9 minutes. The interval
+    # has to be short relative to the crash-free interval, not merely cheap: the
+    # Slurm scripts refuse to requeue a run that ended without passing a checkpoint,
+    # so that a job failing on startup cannot spawn an endless chain of failures.
+    # Runs on this cluster segfault every ~1500-3500 steps, and at 500 that guard
+    # kept tripping on runs that died before banking anything, stalling the chain
+    # until it was resubmitted by hand. A 507 MB save every 200 steps costs ~3%.
+    ckpt_interval_steps: int = 200
     resume: Optional[str] = None
     seed: int = 0
     device: str = "cuda"
