@@ -160,12 +160,15 @@ class DecoupledForecaster(nn.Module):
         # argument, so existing callers/tests that build a DecoupledForecaster directly
         # keep working unchanged. See DRIFT._ckpt for the full rationale.
         self.grad_checkpoint = False
+        self.grad_checkpoint_reentrant = False
 
     def _ckpt(self, fn: Any, *args: Any) -> Any:
         """Gradient-checkpoint ``fn(*args)`` when enabled. Mirrors ``DRIFT._ckpt``."""
         if not (self.grad_checkpoint and self.training and torch.is_grad_enabled()):
             return fn(*args)
-        return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False)
+        return torch.utils.checkpoint.checkpoint(
+            fn, *args, use_reentrant=self.grad_checkpoint_reentrant
+        )
 
     def _gate_merge(self, static_latent: Tensor, dyn_latent: Tensor, dyn_occ: Tensor) -> Tensor:
         """Gated blend of the static and dynamic futures.

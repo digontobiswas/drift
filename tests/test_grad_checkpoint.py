@@ -12,7 +12,17 @@ The two hazards this guards against:
     (the model uses GroupNorm everywhere, which has none -- this test would catch a
     regression that introduced BatchNorm);
   * RNG-dependent layers (`ModalityDropout`) drawing a different mask on recompute,
-    which `use_reentrant=False` prevents by preserving RNG state.
+    which both checkpoint implementations prevent by preserving RNG state. Dropout is
+    left ON in the fixture below precisely so this is exercised rather than asserted.
+
+Everything here runs against BOTH implementations, because `grad_checkpoint_reentrant`
+lets the cluster switch between them: every SIGSEGV on PARAM Shakti landed inside the
+autograd engine, on one GPU and on two, and the reentrant path was worth trying as the
+older and more heavily exercised of the two. Reentrant mode has a failure mode of its
+own, though -- it needs an input of each checkpointed block to require grad, or
+gradients stop at the boundary and the parameters upstream silently stop training,
+with the loss still falling. Comparing both against an uncheckpointed forward is what
+makes that switch safe to make.
 """
 
 from __future__ import annotations
@@ -23,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import pytest
 import torch
 
 from configs import get_config
@@ -30,10 +41,15 @@ from drift.data.cam4docc_dataset import SyntheticOccDataset
 from drift.data.collate import collate_fn
 from drift.models.drift import DRIFT
 
+BOTH_IMPLEMENTATIONS = pytest.mark.parametrize(
+    "reentrant", [True, False], ids=["reentrant", "non_reentrant"]
+)
 
-def _build(grad_checkpoint: bool) -> tuple:
+
+def _build(grad_checkpoint: bool, reentrant: bool = True) -> tuple:
     cfg = get_config("tiny")
     cfg.model.grad_checkpoint = grad_checkpoint
+    cfg.model.grad_checkpoint_reentrant = reentrant
     model = DRIFT(cfg.model, cfg.loss)
     model.train()
 
@@ -43,7 +59,9 @@ def _build(grad_checkpoint: bool) -> tuple:
         num_classes=cfg.model.num_classes, latent_size=cfg.model.latent_size,
         occ_size=cfg.model.occ_size, point_cloud_range=cfg.model.point_cloud_range,
         num_points_range=cfg.data.num_points_range, num_boxes_range=(2, 4),
-        modality_dropout_p=0.0, seed=0,
+        # Non-zero on purpose: with dropout off, an implementation that failed to
+        # restore RNG state before recomputing would still pass every assertion here.
+        modality_dropout_p=0.5, seed=0,
     )
     return model, collate_fn([ds[0]])
 
@@ -77,9 +95,63 @@ class TestGradCheckpointEquivalence:
         assert e4as, "expected at least one EfficientAggregation4D in the model"
         assert all(m.grad_checkpoint for m in e4as)
 
-    def test_outputs_and_grads_match_uncheckpointed(self) -> None:
+    @BOTH_IMPLEMENTATIONS
+    def test_reentrant_choice_reaches_every_submodule(self, reentrant: bool) -> None:
+        """The implementation choice has to propagate as far as the flag itself.
+
+        If it reached only the top-level `_ckpt`, the E4A stages -- the ones this whole
+        mechanism exists for, and the ones running when the segfaults happened -- would
+        keep using the other implementation while the equivalence test below passed.
+        """
+        model, _ = _build(grad_checkpoint=True, reentrant=reentrant)
+        subs = [m for m in model.modules() if m is not model and hasattr(m, "grad_checkpoint")]
+        assert subs, "no submodule declares grad_checkpoint -- propagation is untested"
+        for m in subs:
+            assert m.grad_checkpoint_reentrant is reentrant, (
+                f"{type(m).__name__} kept reentrant={m.grad_checkpoint_reentrant}, "
+                f"not the configured {reentrant}"
+            )
+
+    def test_reentrant_mode_would_silently_freeze_the_encoders(self) -> None:
+        """Pin WHY `grad_checkpoint_reentrant` ships False, so nobody flips it back.
+
+        Reentrant checkpointing propagates gradient only when an input to the
+        checkpointed block requires grad. Here the outer blocks are entered with raw
+        batch tensors that do not, so everything upstream of the first checkpoint --
+        the whole camera backbone and the LiDAR encoder -- receives no gradient and
+        stops training, while the loss keeps falling on the parameters that still do.
+        There is no error and no log line; the only symptom is a model that never
+        learns to see.
+
+        Asserted rather than merely commented, so that if a future PyTorch makes
+        reentrant mode safe here, this fails and the choice gets revisited on purpose.
+        """
         plain, batch = _build(grad_checkpoint=False)
-        ckpt, _ = _build(grad_checkpoint=True)
+        reentrant, _ = _build(grad_checkpoint=True, reentrant=True)
+        reentrant.load_state_dict(copy.deepcopy(plain.state_dict()))
+
+        for model in (plain, reentrant):
+            torch.manual_seed(1234)
+            model.zero_grad(set_to_none=True)
+            sum(model.loss(model(batch), batch).values()).backward()
+
+        def trained(model) -> set:
+            return {n for n, p in model.named_parameters() if p.grad is not None}
+
+        lost = trained(plain) - trained(reentrant)
+        assert lost, (
+            "reentrant checkpointing no longer drops gradients -- the constraint that "
+            "forced grad_checkpoint_reentrant=False may have been lifted; re-run the "
+            "equivalence test with reentrant=True and reconsider the default."
+        )
+        assert any(n.startswith("camera_encoder.") for n in lost), (
+            f"expected the camera encoder among the frozen parameters, got {sorted(lost)[:5]}"
+        )
+
+    def test_outputs_and_grads_match_uncheckpointed(self) -> None:
+        reentrant = False  # the only implementation this model can use; see above
+        plain, batch = _build(grad_checkpoint=False)
+        ckpt, _ = _build(grad_checkpoint=True, reentrant=reentrant)
         # Identical weights: copy rather than re-seed, so this compares only the
         # checkpointing behaviour and not two independent inits.
         ckpt.load_state_dict(copy.deepcopy(plain.state_dict()))

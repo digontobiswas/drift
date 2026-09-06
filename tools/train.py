@@ -324,6 +324,7 @@ def set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
 def save_checkpoint(
     path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
     epoch: int, global_step: int, cfg: DriftConfig, batch_in_epoch: int = 0,
+    world_size: int = 1,
 ) -> None:
     """Write a resumable checkpoint.
 
@@ -338,6 +339,12 @@ def save_checkpoint(
     truncated `latest.pth` -- and since this is the file `03_ablations.slurm`
     auto-resumes from, a corrupt one turns a recoverable interruption into a
     dead run that fails instantly on every requeue.
+
+    `world_size` is recorded because `batch_in_epoch` counts batches on ONE rank, so
+    it means different things at different GPU counts -- resuming a 2-GPU checkpoint
+    on 1 GPU without accounting for that lands half way to where it should. Runs here
+    switch GPU count often, because the queue hands out single free GPUs far sooner
+    than pairs.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     raw_model = model.module if isinstance(model, DistributedDataParallel) else model
@@ -349,6 +356,7 @@ def save_checkpoint(
             "epoch": epoch,
             "global_step": global_step,
             "batch_in_epoch": batch_in_epoch,
+            "world_size": world_size,
             "config_name": cfg.name,
         },
         tmp,
@@ -357,19 +365,40 @@ def save_checkpoint(
 
 
 def load_checkpoint(
-    path: str, model: torch.nn.Module, optimizer: Optional[torch.optim.Optimizer], device: torch.device
+    path: str, model: torch.nn.Module, optimizer: Optional[torch.optim.Optimizer],
+    device: torch.device, world_size: int = 1,
 ) -> "tuple[int, int, int]":
     """Returns `(epoch, global_step, batch_in_epoch)` to resume at.
 
     `batch_in_epoch` is 0 for checkpoints written before it was recorded, which
     makes an older checkpoint simply restart its epoch -- the previous behaviour.
+
+    It counts batches on one rank, so a checkpoint written under a different GPU
+    count has to be rescaled: 8500 batches per rank on 2 GPUs is 17000 samples of
+    the epoch consumed, which is batch 17000 when one rank does all the work. Left
+    unscaled, switching 2 GPUs -> 1 silently resumes half as far into the epoch as
+    it should. The samples themselves differ either way -- the shuffle partitions
+    differently at each GPU count -- so this restores how MUCH of the epoch is done,
+    not which samples did it; within an epoch of a shuffled dataset that is the
+    property that matters.
     """
     ckpt = torch.load(path, map_location=device)
     raw_model = model.module if isinstance(model, DistributedDataParallel) else model
     raw_model.load_state_dict(ckpt["model"])
     if optimizer is not None and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
-    return ckpt.get("epoch", 0), ckpt.get("global_step", 0), ckpt.get("batch_in_epoch", 0)
+
+    batch_in_epoch = ckpt.get("batch_in_epoch", 0)
+    saved_world_size = ckpt.get("world_size", world_size)
+    if batch_in_epoch and saved_world_size != world_size:
+        rescaled = batch_in_epoch * saved_world_size // world_size
+        print(
+            f"[train] checkpoint was written on {saved_world_size} GPU(s), resuming on "
+            f"{world_size}: rescaling batch_in_epoch {batch_in_epoch} -> {rescaled}",
+            flush=True,
+        )
+        batch_in_epoch = rescaled
+    return ckpt.get("epoch", 0), ckpt.get("global_step", 0), batch_in_epoch
 
 
 def main(argv: Optional[list] = None) -> None:
@@ -429,7 +458,7 @@ def main(argv: Optional[list] = None) -> None:
     start_epoch, global_step, resume_batch = 0, 0, 0
     if cfg.train.resume is not None:
         start_epoch, global_step, resume_batch = load_checkpoint(
-            cfg.train.resume, model, optimizer, device
+            cfg.train.resume, model, optimizer, device, world_size=world_size
         )
         if is_main:
             print(
@@ -519,7 +548,7 @@ def main(argv: Optional[list] = None) -> None:
             if is_main and ckpt_every and global_step % ckpt_every == 0:
                 save_checkpoint(
                     ckpt_dir / "latest.pth", model, optimizer, epoch, global_step, cfg,
-                    batch_in_epoch=it + 1,
+                    batch_in_epoch=it + 1, world_size=world_size,
                 )
                 print(
                     f"[train] checkpoint saved at epoch={epoch} it={it} step={global_step}",
@@ -553,7 +582,7 @@ def main(argv: Optional[list] = None) -> None:
             if interrupted or stop:
                 save_checkpoint(
                     ckpt_dir / "latest.pth", model, optimizer, epoch, global_step, cfg,
-                    batch_in_epoch=it + 1,
+                    batch_in_epoch=it + 1, world_size=world_size,
                 )
                 reason = "interrupted by signal" if interrupted else "stopped at max_iters"
                 print(
@@ -564,11 +593,11 @@ def main(argv: Optional[list] = None) -> None:
             else:
                 save_checkpoint(
                     ckpt_dir / f"epoch_{epoch}.pth", model, optimizer, epoch + 1, global_step, cfg,
-                    batch_in_epoch=0,
+                    batch_in_epoch=0, world_size=world_size,
                 )
                 save_checkpoint(
                     ckpt_dir / "latest.pth", model, optimizer, epoch + 1, global_step, cfg,
-                    batch_in_epoch=0,
+                    batch_in_epoch=0, world_size=world_size,
                 )
                 print(f"[train] epoch {epoch} done in {time.time() - t0:.1f}s, checkpoint saved to {ckpt_dir}")
 

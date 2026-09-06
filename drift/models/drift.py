@@ -241,6 +241,7 @@ class DRIFT(nn.Module):
         self.C = C
         self.latent_size = (X, Y, Z)
         self.grad_checkpoint = getattr(cfg, "grad_checkpoint", False)
+        self.grad_checkpoint_reentrant = getattr(cfg, "grad_checkpoint_reentrant", False)
 
         ratios = [o // l for o, l in zip(cfg.occ_size, cfg.latent_size)]
         if any(o % l != 0 for o, l in zip(cfg.occ_size, cfg.latent_size)) or len(set(ratios)) != 1:
@@ -383,6 +384,7 @@ class DRIFT(nn.Module):
             for module in self.modules():
                 if module is not self and hasattr(module, "grad_checkpoint"):
                     module.grad_checkpoint = True
+                    module.grad_checkpoint_reentrant = self.grad_checkpoint_reentrant
 
     def _ckpt(self, fn: Any, *args: Any) -> Any:
         """Run ``fn(*args)`` under gradient checkpointing when it is enabled.
@@ -398,14 +400,17 @@ class DRIFT(nn.Module):
         there is no backward pass to trade against, so checkpointing would be pure
         overhead (and ``checkpoint`` warns when nothing requires grad).
 
-        ``use_reentrant=False`` is deliberate: it preserves RNG state, so
-        ``ModalityDropout`` draws the same mask on the recomputed forward as on the
-        first one. Safe against the usual double-forward hazard because every norm
-        in this model is GroupNorm, which holds no running statistics to corrupt.
+        Either implementation preserves RNG state, so ``ModalityDropout`` draws the
+        same mask on the recomputed forward as on the first one; which one runs is
+        ``cfg.grad_checkpoint_reentrant``, documented there. Safe against the usual
+        double-forward hazard because every norm in this model is GroupNorm, which
+        holds no running statistics to corrupt.
         """
         if not (self.grad_checkpoint and self.training and torch.is_grad_enabled()):
             return fn(*args)
-        return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False)
+        return torch.utils.checkpoint.checkpoint(
+            fn, *args, use_reentrant=self.grad_checkpoint_reentrant
+        )
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Tensor]:
         """Run the full DRIFT pipeline on one batch.

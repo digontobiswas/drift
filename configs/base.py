@@ -219,6 +219,25 @@ class ModelConfig:
     # leave off on a larger card. Safe here because every norm in the model is
     # GroupNorm, which keeps no running statistics for the second forward to corrupt.
     grad_checkpoint: bool = False
+    # Which `torch.utils.checkpoint` implementation runs when the flag above is on.
+    #
+    # MUST stay False for this model. Reentrant checkpointing only propagates gradients
+    # when an input to the checkpointed block requires grad, and here the outermost
+    # blocks are entered with raw batch tensors that do not -- so with reentrant mode
+    # the camera backbone, the LiDAR encoder and everything else upstream of the first
+    # checkpoint receive NO gradient at all. Nothing about that is visible at training
+    # time: the loss still falls, driven by the parameters that do still train.
+    # tests/test_grad_checkpoint.py catches it by comparing against an uncheckpointed
+    # forward, and that test is the only reason it was caught here rather than after a
+    # week of GPU time on a model with a frozen encoder.
+    #
+    # The flag exists because reentrant mode was worth trying against the SIGSEGVs in
+    # `_engine_run_backward`: non-reentrant checkpointing drives its recompute from
+    # saved-tensor hooks that run inside the autograd engine's own graph traversal,
+    # which is precisely where every crash lands. That remains the standing suspect --
+    # but swapping implementations is not an available cure, so ruling checkpointing in
+    # or out means disabling `grad_checkpoint` entirely and paying the memory.
+    grad_checkpoint_reentrant: bool = False
     camera: CameraEncoderConfig = field(default_factory=CameraEncoderConfig)
     lidar: LidarEncoderConfig = field(default_factory=LidarEncoderConfig)
     cmli: CMLIConfig = field(default_factory=CMLIConfig)

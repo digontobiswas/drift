@@ -118,6 +118,30 @@ class TestCheckpointResume:
         )
         assert ckpt["batch_in_epoch"] == 4, ckpt
 
+    def test_resume_position_is_rescaled_when_the_gpu_count_changes(self, tmp_path) -> None:
+        """`batch_in_epoch` counts batches on ONE rank, so it means different things at
+        different GPU counts, and runs here switch counts often -- the queue hands out a
+        single free GPU in seconds and a pair only after hours.
+
+        Resuming a 2-GPU checkpoint on 1 GPU unscaled would restart half as far into the
+        epoch as the work already done, silently repeating a quarter of it every time the
+        allocation changed. Nothing downstream would flag that: the step counter and the
+        loss both carry on looking normal.
+        """
+        path, _, model2, opt2 = _roundtrip(tmp_path, epoch=1, step=8500, batch_in_epoch=8500)
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        ckpt["world_size"] = 2
+        torch.save(ckpt, path)
+
+        _, _, same = load_checkpoint(str(path), model2, opt2, torch.device("cpu"), world_size=2)
+        assert same == 8500, "same GPU count must not rescale"
+
+        _, _, halved = load_checkpoint(str(path), model2, opt2, torch.device("cpu"), world_size=1)
+        assert halved == 17000, (
+            "2 GPUs x 8500 batches is 17000 samples of the epoch; resuming on 1 GPU has "
+            f"to start at batch 17000, not {halved}"
+        )
+
     def test_resume_trains_on_exactly_the_batches_that_were_missed(self) -> None:
         """Resuming at batch k must cover the tail of the epoch and only the tail.
 

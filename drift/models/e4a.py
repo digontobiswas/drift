@@ -150,12 +150,15 @@ class EfficientAggregation4D(nn.Module):
         # the recompute peak to one stage even when an outer checkpoint re-runs this
         # forward.
         self.grad_checkpoint = False
+        self.grad_checkpoint_reentrant = False
 
     def _ckpt(self, fn: Any, *args: Any) -> Any:
         """Gradient-checkpoint ``fn(*args)`` when enabled. Mirrors ``DRIFT._ckpt``."""
         if not (self.grad_checkpoint and self.training and torch.is_grad_enabled()):
             return fn(*args)
-        return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False)
+        return torch.utils.checkpoint.checkpoint(
+            fn, *args, use_reentrant=self.grad_checkpoint_reentrant
+        )
 
     def _down_stage(self, k: int, x: Tensor, size: Tuple[int, int, int]) -> Tensor:
         x = F.interpolate(x, size=size, mode="nearest")
