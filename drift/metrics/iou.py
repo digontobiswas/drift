@@ -164,7 +164,20 @@ class OccupancyIoUMetric:
 
         hists = [fast_hist(pred_labels[:, t], gt_labels[:, t], self.num_classes) for t in range(T_o)]
 
-        cum = torch.zeros(self.num_classes, self.num_classes, dtype=torch.int64)
+        # `fast_hist` produces its result on whatever device `pred`/`label` were on --
+        # i.e. wherever the caller is running eval, typically CUDA. The accumulators
+        # were made in `reset()` with no device (CPU, by torch's default), so the
+        # in-place `+=` below would raise "Expected all tensors to be on the same
+        # device" the first time `update` is ever called under CUDA. Moved here
+        # rather than in `reset()` because the metric is constructed before the
+        # caller has necessarily chosen a device.
+        device = hists[0].device
+        if self._hist_present.device != device:
+            self._hist_present = self._hist_present.to(device)
+            self._hist_future_total = self._hist_future_total.to(device)
+            self._hist_cumulative = [h.to(device) for h in self._hist_cumulative]
+
+        cum = torch.zeros(self.num_classes, self.num_classes, dtype=torch.int64, device=device)
         future_k = 0
         for t in range(T_o):
             if t == self.present_index:

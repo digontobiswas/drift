@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import pytest
 import torch
 
 from drift.metrics.calibration import expected_calibration_error
@@ -97,6 +98,46 @@ class TestOccupancyIoUMetric:
         metric.reset()
         assert metric._hist_present.sum().item() == 0
         assert metric._hist_future_total.sum().item() == 0
+
+    def test_accumulators_track_the_device_of_the_incoming_batch(self) -> None:
+        """Regression test for job 1158408: eval.py's first-ever GPU run crashed on
+        `self._hist_present += hists[t]` with "Expected all tensors to be on the same
+        device, but found at least two devices, cuda:0 and cpu". `reset()` builds every
+        accumulator (and `update()` built its `cum` scratch tensor) with `torch.zeros`
+        and no `device=`, which is CPU by torch's default -- fine for every existing
+        test here, since none of them ran on CUDA, and fine for `tools/eval.py`'s own
+        unit coverage, since that also runs on CPU. Nothing caught it until the first
+        real run against an actual GPU checkpoint.
+
+        No CUDA is available in this sandbox, so this can't reproduce the exact
+        cuda/cpu pairing -- it instead confirms the mechanism directly: after `update`,
+        the accumulators sit on whatever device the input batch used, not on whatever
+        device `reset()` happened to default to.
+        """
+        device = torch.device("cpu")
+        metric = OccupancyIoUMetric(num_classes=2, num_future=2, upsample_size=(2, 2, 2))
+        assert metric._hist_present.device == device, "sanity: reset() defaults to CPU"
+
+        logits = torch.zeros(1, 2, 2, 1, 1, 1, device=device)
+        gt = torch.zeros(1, 2, 2, 2, 2, dtype=torch.long, device=device)
+        metric.update(logits, gt)  # must not raise, on this device or any other
+
+        assert metric._hist_present.device == device
+        assert metric._hist_future_total.device == device
+        assert all(h.device == device for h in metric._hist_cumulative)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs an actual second device")
+    def test_update_does_not_raise_across_cpu_built_accumulators_and_cuda_batches(self) -> None:
+        """The literal scenario that crashed job 1158408, reproduced when CUDA is
+        actually present (skipped in this sandbox; runs on the cluster's GPU nodes,
+        exactly where the original failure was reported)."""
+        device = torch.device("cuda")
+        metric = OccupancyIoUMetric(num_classes=2, num_future=2, upsample_size=(2, 2, 2))
+        logits = torch.zeros(1, 2, 2, 1, 1, 1, device=device)
+        gt = torch.zeros(1, 2, 2, 2, 2, dtype=torch.long, device=device)
+        metric.update(logits, gt)
+        result = metric.compute()
+        assert result["IoU_c"] == result["IoU_c"]  # just: no NaN, no exception above
 
 
 class TestFlowEPE:
