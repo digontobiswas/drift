@@ -310,14 +310,25 @@ class TrainConfig:
     # means any mid-epoch crash (a segfault, a node failure, a walltime kill)
     # throws away every hour of work since the epoch began. Set 0 to disable.
     #
-    # At ~2.6 s/step, 200 steps caps that loss at roughly 9 minutes. The interval
-    # has to be short relative to the crash-free interval, not merely cheap: the
-    # Slurm scripts refuse to requeue a run that ended without passing a checkpoint,
-    # so that a job failing on startup cannot spawn an endless chain of failures.
-    # Runs on this cluster segfault every ~1500-3500 steps, and at 500 that guard
-    # kept tripping on runs that died before banking anything, stalling the chain
-    # until it was resubmitted by hand. A 507 MB save every 200 steps costs ~3%.
-    ckpt_interval_steps: int = 200
+    # The interval has to be short relative to the crash-free interval, not merely
+    # cheap, because the Slurm scripts treat a run that ended without passing a
+    # checkpoint as having made no progress -- a guard that stops a job failing on
+    # startup from spawning an endless chain of failures.
+    #
+    # 200 was chosen against a segfault every ~1500-3500 steps. Job 1159744 broke that
+    # assumption: it resumed at step 87000, segfaulted somewhere around step 87100-87140,
+    # and so died before reaching the save at 87200. The checkpoint still read 87000, the
+    # guard called it a stall, and the successor resumed at 87000 to repeat the same
+    # doomed ~100 steps. Whenever the crash distance drops below this interval the chain
+    # cannot bank anything at all: every run discards 100% of its work and the stall
+    # counter climbs to its limit, so training stops for good rather than merely slowing
+    # down. That is a deadlock, and this interval is what breaks it.
+    #
+    # 50 sits below the ~100-step distance actually observed, so even a run that dies
+    # that fast still banks something and the chain keeps moving. A 507 MB save costs
+    # ~14 s, making this ~12% of throughput -- a real price, paid because the
+    # alternative measured on job 1159744 was 0% of throughput.
+    ckpt_interval_steps: int = 50
     resume: Optional[str] = None
     seed: int = 0
     device: str = "cuda"

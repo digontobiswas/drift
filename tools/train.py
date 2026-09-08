@@ -219,6 +219,38 @@ def build_epoch_loader(
     )
 
 
+def in_flight_samples(order: "list[int]", it: int, batch_size: int) -> "list[int]":
+    """The dataset indices making up batch `it`, mirroring `build_epoch_loader`'s slicing."""
+    lo = it * batch_size
+    return order[lo:lo + batch_size]
+
+
+def record_in_flight(path: Path, epoch: int, it: int, global_step: int, samples: "list[int]") -> None:
+    """Overwrite a one-line note naming the batch currently in the forward/backward.
+
+    A SIGSEGV leaves a faulthandler traceback, which says the fault was inside
+    `_engine_run_backward` and nothing more. What that cannot say is WHICH sample was
+    being trained on -- the one fact that separates a random memory fault, where the
+    position is meaningless, from an input the model genuinely cannot process, where
+    the same sample kills every attempt. Job 1159744 died about a hundred steps after
+    resuming into the same region of epoch 3 that had killed its predecessor, which is
+    the pattern that question is worth asking about.
+
+    `epoch_index_order` is deterministic in (seed, epoch), so an index recorded here
+    names the same sample on every resume and can be replayed on its own afterwards.
+
+    Never allowed to interrupt training: this is a diagnostic, and a shared-filesystem
+    hiccup while writing one must not end a run that is otherwise perfectly healthy.
+    """
+    try:
+        path.write_text(
+            f"epoch={epoch} it={it} step={global_step} "
+            f"samples={','.join(str(s) for s in samples)}\n"
+        )
+    except Exception:
+        pass
+
+
 def _move(obj: Any, device: torch.device) -> Any:
     """Move one leaf to `device`. Tensors get `non_blocking`; other `.to()`-ables do not."""
     if torch.is_tensor(obj):
@@ -506,6 +538,9 @@ def main(argv: Optional[list] = None) -> None:
         it = skip_batches - 1
         for local_it, batch in enumerate(epoch_loader):
             it = skip_batches + local_it
+            samples = in_flight_samples(order, it, cfg.data.batch_size)
+            if is_main:
+                record_in_flight(ckpt_dir / "in_flight.txt", epoch, it, global_step, samples)
             batch = move_batch_to_device(batch, device)
 
             current_lr = lr_at_step(cfg, global_step, total_steps)
@@ -534,7 +569,8 @@ def main(argv: Optional[list] = None) -> None:
                 loss_str = " ".join(f"{k}={v.item():.4f}" for k, v in losses.items())
                 elapsed = time.time() - t0
                 print(
-                    f"[train] epoch={epoch} it={it} step={global_step} lr={current_lr:.3e} "
+                    f"[train] epoch={epoch} it={it} step={global_step} "
+                    f"sample={','.join(str(s) for s in samples)} lr={current_lr:.3e} "
                     f"total_loss={total_loss.item():.4f} {loss_str} ({elapsed:.1f}s)",
                     flush=True,
                 )

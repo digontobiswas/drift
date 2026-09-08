@@ -114,8 +114,15 @@ echo "[train] $CONFIG exited with status $TRAIN_RC. Checkpoints in $DRIFT_CKPT_D
 # DRIFT_MAX_STALLS consecutive attempts with nothing to show -- stops the chain. The
 # counter resets on any real progress, so an occasional unlucky run never accumulates
 # toward the limit.
+#
+# The limit was 3, which turned out to be far too tight for the way this actually fails.
+# A stalled run costs about seven minutes of queue and startup and nothing else, whereas
+# hitting the limit stops training silently -- discovered hours later, by which point the
+# GPU has sat idle the whole time. The two outcomes are not remotely symmetric, so the
+# tolerance is set where a bad patch is survivable: eight stalls is under an hour of
+# wasted scheduling, against a chain that no longer dies overnight unattended.
 STALLS="${DRIFT_STALL_COUNT:-0}"
-MAX_STALLS="${DRIFT_MAX_STALLS:-3}"
+MAX_STALLS="${DRIFT_MAX_STALLS:-8}"
 
 read -r END_EPOCH END_STEP < <(python tools/ckpt_info.py "$CKPT")
 echo "[train] reached epoch=$END_EPOCH step=$END_STEP (target $EPOCHS epochs)"
