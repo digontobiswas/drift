@@ -26,9 +26,18 @@ out to be unnecessary can be undone exactly.
 
 Usage
 -----
-    python tools/skip_ahead.py <ckpt> --by 300      # 300 batches past where it is now
-    python tools/skip_ahead.py <ckpt> --to 19900    # or name the batch to resume at
-    python tools/skip_ahead.py <ckpt> --restore     # undo, from the .bak copy
+    python tools/skip_ahead.py <ckpt> --by 300        # 300 batches past where it is now
+    python tools/skip_ahead.py <ckpt> --to 19900      # or name the batch to resume at
+    python tools/skip_ahead.py <ckpt> --next-epoch    # abandon the rest of this epoch
+    python tools/skip_ahead.py <ckpt> --restore       # undo, from the .bak copy
+
+`--next-epoch` exists because a bad stretch near the end of an epoch cannot be stepped
+over by `--by`: there is nowhere left inside the epoch to land, and a batch index at or
+past the epoch length is not a state the training loop can resume from. Job 1160742 hit
+exactly that, dying repeatedly at batch 22210 of 22530. Rolling to the next epoch writes
+the same `(epoch + 1, batch_in_epoch=0)` an epoch-end save writes, so nothing downstream
+can tell it apart from an epoch that finished on its own -- and the next epoch reshuffles,
+so the abandoned batches come back in a different order rather than being lost.
 
 `global_step` is advanced to match, so the LR schedule stays aligned with the batches
 actually consumed rather than drifting behind them.
@@ -51,10 +60,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--by", type=int, help="advance batch_in_epoch by this many batches")
     g.add_argument("--to", type=int, help="set batch_in_epoch to exactly this batch")
+    g.add_argument(
+        "--next-epoch", action="store_true",
+        help="abandon the rest of this epoch and resume at the start of the next one",
+    )
     g.add_argument("--restore", action="store_true", help="undo a previous skip from the .bak copy")
     p.add_argument(
         "--epoch-batches", type=int, default=22530,
         help="batches in one epoch, used to refuse a skip that would run off the end (default: 22530)",
+    )
+    p.add_argument(
+        "--force", action="store_true",
+        help="allow --next-epoch to abandon more than a tail end of the epoch",
     )
     return p.parse_args(argv)
 
@@ -82,6 +99,40 @@ def main(argv=None) -> int:
     old_step = ckpt.get("global_step", 0)
     epoch = ckpt.get("epoch", 0)
 
+    if args.next_epoch:
+        advanced = args.epoch_batches - old_batch
+        # This flag is for escaping a bad patch in the last stretch of an epoch. Run by
+        # mistake on a checkpoint sitting at the START of one -- which is what an
+        # epoch-end save leaves behind, so it is the state most likely to be lying around
+        # -- the same code path would discard a whole untrained epoch and report it in the
+        # same reassuring tone as abandoning a few hundred batches. Refuse unless what is
+        # being given up really is a tail end, and say the number out loud either way.
+        limit = max(1, int(args.epoch_batches * 0.05))
+        if advanced > limit and not args.force:
+            print(
+                f"[skip] refusing: batch_in_epoch is {old_batch}, so --next-epoch would "
+                f"abandon {advanced} of this epoch's {args.epoch_batches} batches, not a tail "
+                f"end (the limit is {limit}). If that is genuinely what you want, pass --force.",
+                file=sys.stderr,
+            )
+            return 1
+        ckpt["epoch"] = epoch + 1
+        ckpt["batch_in_epoch"] = 0
+        ckpt["global_step"] = old_step + advanced
+
+        shutil.copy2(path, backup)
+        tmp = path.with_name(path.name + ".tmp")
+        torch.save(ckpt, tmp)
+        os.replace(tmp, path)
+
+        print(f"[skip] backed up the previous checkpoint to {backup}")
+        print(
+            f"[skip] abandoned the last {advanced} batches of epoch {epoch}; "
+            f"resuming at epoch {epoch + 1} batch 0, global_step {old_step} -> {ckpt['global_step']}"
+        )
+        print("[skip] resubmit training to resume from the new position")
+        return 0
+
     new_batch = old_batch + args.by if args.by is not None else args.to
     if new_batch <= old_batch:
         print(
@@ -93,7 +144,8 @@ def main(argv=None) -> int:
     if new_batch >= args.epoch_batches:
         print(
             f"[skip] refusing: batch {new_batch} is past the end of a {args.epoch_batches}-batch "
-            "epoch. To finish this epoch, let it run out normally rather than skipping past it.",
+            "epoch, which is not a position the training loop can resume from. To give up on "
+            "the rest of this epoch, use --next-epoch.",
             file=sys.stderr,
         )
         return 1
