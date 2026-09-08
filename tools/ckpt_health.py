@@ -46,6 +46,17 @@ import torch
 HUGE = 1e4
 
 
+def _is_counter(name: str) -> bool:
+    """AdamW stores its per-parameter step COUNT alongside the moment buffers, as a
+    float tensor. It is supposed to grow without bound -- it equals the number of
+    optimizer steps taken -- so the divergence heuristic below must not be pointed at
+    it. Left in, it reports every healthy checkpoint past ten thousand steps as damaged,
+    which is not a harmless false alarm: the whole point of this script is to decide
+    whether to throw a run away and restart from an earlier checkpoint.
+    """
+    return name.endswith(".step")
+
+
 def _scan(tensors) -> "tuple[int, int, float, list[str]]":
     """Count non-finite entries across named tensors; return the worst offenders too."""
     n_nan = n_inf = 0
@@ -61,10 +72,15 @@ def _scan(tensors) -> "tuple[int, int, float, list[str]]":
         peak = float(finite.abs().max()) if finite.numel() else 0.0
         n_nan += nan
         n_inf += inf
-        largest = max(largest, peak)
         if nan or inf:
             offenders.append(f"{name}: {nan} NaN, {inf} Inf")
-        elif peak > HUGE:
+            continue
+        # Counters are checked for NaN/Inf like everything else, but their magnitude
+        # carries no information about the health of the run.
+        if _is_counter(name):
+            continue
+        largest = max(largest, peak)
+        if peak > HUGE:
             offenders.append(f"{name}: finite but huge (max |x| = {peak:.3g})")
     return n_nan, n_inf, largest, offenders
 
