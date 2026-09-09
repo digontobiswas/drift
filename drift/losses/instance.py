@@ -16,8 +16,10 @@ fields is duck-typed.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -34,6 +36,11 @@ except ImportError:  # pragma: no cover
     _HAS_SCIPY = False
 
 __all__ = ["instance_loss"]
+
+# How many times a non-finite cost matrix has been seen this process. Reported on the
+# first occurrence and then at each power of ten, so a rare event is visible and a
+# constant one is obvious without a line per batch.
+_nonfinite_cost_batches = 0
 
 
 def _sigmoid_focal_loss(logits: Tensor, targets: Tensor, alpha: float = 0.25, gamma: float = 2.0) -> Tensor:
@@ -65,6 +72,21 @@ def _linear_sum_assignment_with_fallback(cost: Tensor) -> Tuple[List[int], List[
     otherwise falls back to a greedy nearest-cost matcher (globally suboptimal
     but dependency-free and adequate for a training-time auxiliary loss).
 
+    Non-finite entries are replaced with a cost worse than any real pairing rather than
+    passed through. `scipy.optimize.linear_sum_assignment` rejects them outright --
+    "ValueError: matrix contains invalid numeric entries" -- and that exception killed
+    training runs repeatedly on real data: under AMP the instance head's fp16 activations
+    overflow (fp16 tops out at 65504) once the weights have grown enough, one prediction
+    goes non-finite, and the whole job dies mid-epoch.
+
+    Letting the run continue is safe here, and not merely expedient. A non-finite
+    prediction produces a non-finite loss, whose gradients `GradScaler` detects and whose
+    optimizer step it therefore skips, so nothing corrupt reaches the weights either way.
+    The only thing the exception was accomplishing was ending the run. A broken
+    prediction should lose every match it could have won, which is what an
+    unattractive-but-finite cost expresses, so the matcher pairs the remaining queries
+    sensibly instead of not running at all.
+
     Args:
         cost: `(N_query, N_gt)` cost matrix.
 
@@ -75,6 +97,26 @@ def _linear_sum_assignment_with_fallback(cost: Tensor) -> Tuple[List[int], List[
     n_q, n_g = cost_np.shape
     if n_q == 0 or n_g == 0:
         return [], []
+
+    finite = np.isfinite(cost_np)
+    if not finite.all():
+        global _nonfinite_cost_batches
+        _nonfinite_cost_batches += 1
+        n_bad = int((~finite).sum())
+        if _nonfinite_cost_batches == 10 ** int(math.log10(_nonfinite_cost_batches)):
+            print(
+                f"[instance_loss] non-finite entries in the matching cost matrix "
+                f"({n_bad}/{cost_np.size} this batch; {_nonfinite_cost_batches} batches so far). "
+                "Treating them as unmatchable. Recurring often means the instance head is "
+                "overflowing fp16 under AMP.",
+                flush=True,
+            )
+        # Worse than the worst real pairing, so a finite alternative always wins. With
+        # nothing finite to compare against, every pairing is equally meaningless and a
+        # flat matrix lets the solver return an arbitrary but valid assignment.
+        worst = cost_np[finite].max() if finite.any() else 0.0
+        cost_np = np.where(finite, cost_np, worst + 1.0)
+
     if _HAS_SCIPY:
         row, col = linear_sum_assignment(cost_np)
         return row.tolist(), col.tolist()
@@ -124,7 +166,16 @@ def _box_cost_matrix(
     pred_center: Tensor, pred_size: Tensor, pred_yaw: Tensor, gt_center: Tensor, gt_size: Tensor,
     gt_yaw: Tensor, pc_range: Optional[List[float]] = None,
 ) -> Tensor:
-    """Pairwise L1 box cost, `(N_query, N_gt)`, on range-normalized coordinates."""
+    """Pairwise L1 box cost, `(N_query, N_gt)`, on range-normalized coordinates.
+
+    Computed in fp32 even when the caller is inside an autocast region. Predicted centres
+    and sizes are unbounded regression outputs, and in fp16 a large one overflows to Inf
+    at 65504 -- which then poisons the whole cost matrix through `cdist`. Matching is a
+    handful of small matrices per batch, so the wider dtype costs nothing measurable and
+    removes an entire way for the loss to become non-finite.
+    """
+    pred_center, pred_size, pred_yaw = pred_center.float(), pred_size.float(), pred_yaw.float()
+    gt_center, gt_size, gt_yaw = gt_center.float(), gt_size.float(), gt_yaw.float()
     return (
         torch.cdist(_norm_center(pred_center, pc_range), _norm_center(gt_center, pc_range), p=1)
         + torch.cdist(_norm_size(pred_size, pc_range), _norm_size(gt_size, pc_range), p=1)
@@ -134,7 +185,7 @@ def _box_cost_matrix(
 
 def _cls_cost_matrix(pred_logits: Tensor, gt_label: Tensor) -> Tensor:
     """Pairwise classification cost `(N_query, N_gt)`: negative predicted prob of the gt class."""
-    probs = torch.sigmoid(pred_logits)  # (N_query, num_classes)
+    probs = torch.sigmoid(pred_logits.float())  # (N_query, num_classes)
     # cost[q, g] = -probs[q, gt_label[g]]  (lower cost = query more confidently predicts that class)
     return -probs[:, gt_label]
 
