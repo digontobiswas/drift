@@ -20,6 +20,11 @@ scipy>=1.10
 # this a wheel-only install everywhere.
 Pillow>=10.0,<11.0
 
+# Figures and qualitative scene renders (tools/plot_results.py, tools/visualize_scenes.py).
+# nuscenes-devkit already pulls matplotlib in, but a training-only environment that drops the
+# devkit would silently lose the reporting tools too, so it is named here in its own right.
+matplotlib>=3.5
+
 # Raw nuScenes -> Cam4DOcc preprocessing (tools/prepare_nuscenes.py) only.
 # Nothing in drift/ imports it, so a training-only environment can drop it.
 nuscenes-devkit>=1.1.11

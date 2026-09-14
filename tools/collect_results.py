@@ -92,17 +92,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     if robust_files:
         lines.append("\n## Sensor-degradation robustness\n")
         first = _load(robust_files[0]) or {}
-        scenarios = [s.get("name", f"s{i}") for i, s in enumerate(first.get("scenarios", []))]
+        # `tools/run_robustness.py` writes `payload["table"]`: a dict keyed by scenario name,
+        # each value a row carrying IoU_c / IoU_f / IoU_f_degradation_pct. This previously read
+        # a `payload["scenarios"]` list that the tool has never written, so the entire section
+        # rendered as nothing at all, with no error to say why.
+        scenarios = list((first.get("table") or {}).keys())
         if scenarios:
             lines.append("| Config | " + " | ".join(scenarios) + " |")
             lines.append("|---" * (len(scenarios) + 1) + "|")
             for f in robust_files:
                 data = _load(f) or {}
                 cfg_name = data.get("config", f.stem.replace("robustness_", ""))
-                cells = []
-                for s in data.get("scenarios", []):
-                    m = s.get("iou", {}).get("IOU_mean")
-                    cells.append(_fmt(m))
+                table = data.get("table") or {}
+                cells = [_fmt((table.get(s) or {}).get("IoU_f")) for s in scenarios]
                 lines.append(f"| `{cfg_name}` | " + " | ".join(cells) + " |")
             lines.append("\n_The gap between `cam4docc_gmo` and `no_cmli` across these columns "
                          "is the cross-modal-imagination claim._\n")
@@ -118,13 +120,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         for f in lat_files:
             data = _load(f) or {}
             name = data.get("config", f.stem.replace("latency_", ""))
-            lat = data.get("latency_ms", {})
-            mean = lat.get("mean") if isinstance(lat, dict) else lat
-            mem = data.get("peak_memory_gb") or data.get("peak_memory_mb")
-            if mem and "peak_memory_mb" in data and "peak_memory_gb" not in data:
-                mem = mem / 1024.0
-            params = data.get("num_parameters")
-            params_m = params / 1e6 if isinstance(params, (int, float)) else None
+            # Same class of mismatch as the robustness section above: the flat keys read here
+            # before (`latency_ms`, `peak_memory_gb`, `num_parameters`) are not what
+            # `tools/benchmark_latency.py` writes. It nests them, and reports parameters in
+            # millions already.
+            mean = (data.get("latency") or {}).get("mean_ms")
+            peak_mb = (data.get("memory") or {}).get("peak_mb")
+            mem = peak_mb / 1024.0 if isinstance(peak_mb, (int, float)) else None
+            params_m = (data.get("params") or {}).get("total_m")
             lines.append(f"| `{name}` | {_fmt(mean, 2)} | {_fmt(mem, 2)} | {_fmt(params_m, 1)} |")
         lines.append("")
     else:

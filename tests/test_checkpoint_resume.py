@@ -27,7 +27,9 @@ from tools.train import (
     build_dataset,
     build_epoch_loader,
     epoch_index_order,
+    in_flight_samples,
     load_checkpoint,
+    record_in_flight,
     save_checkpoint,
 )
 
@@ -179,6 +181,43 @@ class TestCheckpointResume:
 
         assert epoch_index_order(dataset, None, epoch=2, seed=cfg.train.seed) == first
         assert epoch_index_order(dataset, None, epoch=3, seed=cfg.train.seed) != first
+
+    def test_breadcrumb_names_the_sample_the_loader_actually_yields(self) -> None:
+        """The crash breadcrumb is only worth writing if it names the right sample.
+
+        It reconstructs the batch's dataset indices arithmetically rather than reading
+        them off the loader, so the two can silently disagree -- and a breadcrumb that
+        is off by one batch is worse than none at all, because it would send the next
+        investigation to a sample that is perfectly fine while the real culprit keeps
+        killing runs. Pin them against each other, across a resume offset, since that
+        is where the arithmetic is actually load-bearing.
+        """
+        cfg = get_config("tiny")
+        dataset = build_dataset(cfg)
+        bs = cfg.data.batch_size
+        order = epoch_index_order(dataset, None, epoch=3, seed=cfg.train.seed)
+
+        skip = max(1, len(order) // bs // 2)
+        loader = build_epoch_loader(cfg, dataset, order, skip, drop_last=False)
+        remaining = list(loader.sampler)
+
+        for local_it in range(len(loader)):
+            it = skip + local_it
+            assert in_flight_samples(order, it, bs) == remaining[local_it * bs:(local_it + 1) * bs], (
+                f"breadcrumb disagrees with the loader at it={it}"
+            )
+
+    def test_breadcrumb_failure_cannot_take_down_training(self, tmp_path) -> None:
+        """Writing the breadcrumb sits in the hot loop on a shared filesystem, so it has
+        to fail silently. A diagnostic that can kill an otherwise-healthy run costs more
+        than the information it was added to collect."""
+        unwritable = tmp_path / "no_such_dir" / "in_flight.txt"
+        record_in_flight(unwritable, epoch=3, it=19410, global_step=87000, samples=[7])
+        assert not unwritable.exists()
+
+        good = tmp_path / "in_flight.txt"
+        record_in_flight(good, epoch=3, it=19410, global_step=87000, samples=[7, 8])
+        assert good.read_text().strip() == "epoch=3 it=19410 step=87000 samples=7,8"
 
     def test_overwrite_keeps_previous_checkpoint_loadable(self, tmp_path) -> None:
         """Re-saving over an existing latest.pth must not corrupt it -- periodic saves
