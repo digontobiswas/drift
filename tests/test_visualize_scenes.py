@@ -17,8 +17,11 @@ import numpy as np
 import pytest
 
 from tools.visualize_scenes import (
+    GMO_CLASS_NAMES,
     bev_from_occupancy,
+    class_labels,
     disagreement_map,
+    legend_handles,
     lidar_bev,
     pick_indices,
     render_scene,
@@ -106,6 +109,38 @@ class TestSceneSelection:
 
     def test_an_empty_split_yields_nothing(self) -> None:
         assert pick_indices(0, 4) == []
+
+
+class TestLegendNamesTheClasses:
+    def test_the_gmo_preset_gets_real_names_not_indices(self) -> None:
+        """A paper figure legend reading "class 1 / class 2" tells a reader nothing. The
+        3-class preset's meanings are fixed by the config, so the legend can say them."""
+        assert class_labels(3) == GMO_CLASS_NAMES
+        assert "movable" in class_labels(3)[2]
+
+    def test_the_seventeen_class_vocabulary_is_used_when_it_applies(self) -> None:
+        labels = class_labels(17)
+        assert labels[0] == "free" and "pedestrian" in labels
+
+    def test_an_unknown_class_count_falls_back_rather_than_guessing(self) -> None:
+        """Inventing names for a class count nobody defined would put confident, wrong
+        labels in a figure -- worse than an honest index."""
+        assert class_labels(5) == ["class 0", "class 1", "class 2", "class 3", "class 4"]
+
+    def test_free_space_gets_no_swatch(self) -> None:
+        """Free is drawn as the page colour. A legend swatch matching the background reads
+        as a printing fault, and it is the one class a reader never needs pointed out."""
+        _, labels = legend_handles(3)
+        assert "free" not in labels
+        assert labels[:2] == GMO_CLASS_NAMES[1:]
+
+    def test_disagreement_entries_can_be_left_out(self) -> None:
+        """A layout with no disagreement panel must not advertise those colours -- the
+        reader goes looking for a colour that is not in the picture."""
+        _, with_errors = legend_handles(3)
+        _, without = legend_handles(3, include_disagreement=False)
+        assert len(with_errors) == len(without) + 3
+        assert not [l for l in without if "missed" in l or "spurious" in l]
 
 
 class TestRenderRunsEndToEnd:

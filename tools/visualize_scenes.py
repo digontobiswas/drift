@@ -71,6 +71,65 @@ INK = "#1a1a1a"
 INK_MUTED = "#6b6b6b"
 
 
+# Class names for the 3-class `cam4docc_gmo` preset. `tools/eval.py`'s `_class_names` returns
+# generic "class_0/1/2" here because it only special-cases the 17-class vocabulary -- fine for
+# a metrics table keyed by index, useless in a figure legend a reader has to interpret. The
+# meanings come from `configs/drift_fusion_nuscenes.py`'s `cam4docc_gmo` docstring.
+GMO_CLASS_NAMES = ["free", "static (GSO)", "movable (GMO)"]
+
+
+def class_labels(num_classes: int) -> "list[str]":
+    """Human-readable class names for a legend.
+
+    Args:
+        num_classes: Number of occupancy classes in the run.
+
+    Returns:
+        One label per class, in class-index order. Falls back to ``"class i"`` for any class
+        count that is neither the 3-class GMO preset nor the 17-class nuScenes vocabulary,
+        rather than guessing at names that would be wrong.
+    """
+    if num_classes == len(GMO_CLASS_NAMES):
+        return list(GMO_CLASS_NAMES)
+    from tools.eval import _CAM4DOCC_17_CLASS_NAMES
+
+    if num_classes == len(_CAM4DOCC_17_CLASS_NAMES):
+        return list(_CAM4DOCC_17_CLASS_NAMES)
+    return [f"class {i}" for i in range(num_classes)]
+
+
+def legend_handles(num_classes: int, include_disagreement: bool = True):
+    """The one legend every occupancy figure uses, so a colour never means two things.
+
+    Class 0 is omitted deliberately: free space is drawn as the page colour, not as ink, and
+    a legend swatch for "free" that matches the background reads as a printing error.
+
+    Args:
+        num_classes: Number of occupancy classes in the run.
+        include_disagreement: Whether to append the three error categories. False for a figure
+            that shows only occupancy maps, where those colours never appear.
+
+    Returns:
+        ``(handles, labels)`` ready to hand to ``fig.legend``.
+    """
+    cmap = _occupancy_cmap(max(num_classes, 3))
+    handles, labels = [], []
+    for i, name in enumerate(class_labels(num_classes)):
+        if i == 0:
+            continue
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor=cmap(i)))
+        labels.append(name)
+    if include_disagreement:
+        for key, label in (
+            ("missed", "missed (GT only)"),
+            ("spurious", "spurious (pred only)"),
+            ("wrong_class", "wrong class"),
+        ):
+            handles.append(plt.Rectangle((0, 0), 1, 1, facecolor=DISAGREE_COLOURS[key]))
+            labels.append(label)
+    return handles, labels
+
+
 def bev_from_occupancy(occ: np.ndarray) -> np.ndarray:
     """Collapse a ``(X, Y, Z)`` class grid to a ``(X, Y)`` top-down class map.
 
@@ -273,14 +332,9 @@ def render_scene(
             ax_pr.set_ylabel("DRIFT forecast", fontsize=8, color=INK)
             ax_df.set_ylabel("disagreement", fontsize=8, color=INK)
 
-    handles = [plt.Rectangle((0, 0), 1, 1, facecolor=STATIC_RGB),
-               plt.Rectangle((0, 0), 1, 1, facecolor=MOVABLE_RGB)]
-    labels = ["static occupancy", "movable object"]
-    handles += [plt.Rectangle((0, 0), 1, 1, facecolor=DISAGREE_COLOURS[k])
-                for k in ("missed", "spurious", "wrong_class")]
-    labels += ["missed (GT only)", "spurious (pred only)", "wrong class"]
-    fig.legend(handles, labels, loc="lower center", ncol=5, frameon=False, fontsize=8,
-               bbox_to_anchor=(0.5, -0.012))
+    handles, labels = legend_handles(num_classes)
+    fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 5), frameon=False,
+               fontsize=8, bbox_to_anchor=(0.5, -0.012))
     fig.suptitle(title, fontsize=10, color=INK, y=0.98)
     return fig
 
