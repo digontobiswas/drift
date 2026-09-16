@@ -90,6 +90,8 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--present-index", type=int, default=0, help="Output index treated as 'present' for IoU bucketing.")
     p.add_argument("--ece-bins", type=int, default=15)
+    p.add_argument("--log-interval", type=int, default=50,
+                   help="Print progress every N batches (0 to disable).")
     p.add_argument("--json-out", type=str, default=None, help="Optional path to dump the full results dict as JSON.")
     return p.parse_args(argv)
 
@@ -284,6 +286,7 @@ def run_eval(
     present_index: int = 0,
     ece_bins: int = 15,
     num_batches: Optional[int] = None,
+    log_interval: int = 50,
 ) -> Dict[str, Any]:
     """Run the full evaluation loop and return the assembled results dict.
 
@@ -295,6 +298,7 @@ def run_eval(
         present_index: Forwarded to ``OccupancyIoUMetric``.
         ece_bins: Number of ECE confidence bins.
         num_batches: If set, stop after this many batches (fast smoke run).
+        log_interval: Print progress every this many batches; 0 disables it.
 
     Returns:
         Dict with keys ``iou`` (the ``OccupancyIoUMetric.compute()`` dict, tensors converted
@@ -309,6 +313,12 @@ def run_eval(
     )
     flow_metric = FlowEPEMetric()
     ece_metric = ECEAccumulator(num_bins=ece_bins)
+
+    # Total is known only when the loader can report a length and no cap is in force.
+    try:
+        total = len(loader) if num_batches is None else min(num_batches, len(loader))
+    except TypeError:  # an IterableDataset has no length; progress degrades to a counter
+        total = None
 
     n_samples = 0
     n_batches_seen = 0
@@ -328,6 +338,25 @@ def run_eval(
 
             n_samples += batch["imgs"].shape[0]
             n_batches_seen += 1
+
+            # A silent evaluation is one nobody can budget walltime for. This run was killed
+            # by a one-hour limit with no way to tell afterwards whether it had reached 5% or
+            # 95%, so the rate and the projected finish are printed as it goes: a job that is
+            # not going to make its limit says so in the first minute rather than at the end.
+            if log_interval and n_batches_seen % log_interval == 0:
+                elapsed = time.time() - t0
+                rate = elapsed / n_batches_seen
+                if total:
+                    remaining = (total - n_batches_seen) * rate
+                    print(
+                        f"[eval] {n_batches_seen}/{total} batches "
+                        f"({100.0 * n_batches_seen / total:.1f}%) — {rate:.2f}s/batch, "
+                        f"elapsed {elapsed / 60:.1f} min, ~{remaining / 60:.1f} min left",
+                        flush=True,
+                    )
+                else:
+                    print(f"[eval] {n_batches_seen} batches — {rate:.2f}s/batch, "
+                          f"elapsed {elapsed / 60:.1f} min", flush=True)
     elapsed = time.time() - t0
 
     iou_result = iou_metric.compute()
@@ -446,6 +475,7 @@ def main(argv: Optional[list] = None) -> None:
     results = run_eval(
         model, loader, cfg, device,
         present_index=args.present_index, ece_bins=args.ece_bins, num_batches=args.num_batches,
+        log_interval=args.log_interval,
     )
 
     report = format_report(results, cfg, checkpoint_desc)

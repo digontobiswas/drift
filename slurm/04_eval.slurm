@@ -3,7 +3,7 @@
 #SBATCH --partition=gpu
 #SBATCH --output=logs/eval_%A_%a.out
 #SBATCH --error=logs/eval_%A_%a.err
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
@@ -16,6 +16,13 @@
 # README §4.1 and the ablation table in PROBLEM_STATEMENT_AND_EXPERIMENTS §8.
 #
 #     cd $SCRATCH/drift && sbatch slurm/04_eval.slurm
+#
+# On the walltime: an attempt at one hour was killed by the limit mid-run, losing the whole
+# evaluation and the queue position it had waited a day for. Shortening the request does get a
+# job scheduled sooner on a saturated cluster, but a timeout costs everything the run had done
+# and buys nothing, so this errs long. tools/eval.py now prints its rate and projected finish
+# every 50 batches, so a run that is not going to make the limit says so within a minute or two
+# instead of at the end.
 #
 # Then collect them into markdown tables:
 #     python tools/collect_results.py --results-dir $DRIFT_RESULTS_DIR
