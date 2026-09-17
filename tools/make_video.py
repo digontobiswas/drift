@@ -35,14 +35,20 @@ Output is a GIF, written with Pillow, which is already a dependency -- no ffmpeg
 MP4 is written as well when ffmpeg happens to be available, since a GIF of forty frames is
 large and MP4 is what a submission site will want.
 
-On scene boundaries
--------------------
-`--mode temporal` must not run past the end of a drive. The annotation file has no scene id,
-but every sample's LiDAR filename carries the nuScenes log prefix and a microsecond timestamp
-(``n008-2018-08-01-15-16-36-0400__LIDAR_TOP__1533151603547590.pcd.bin``), which is enough:
-frames belong to the same run when the prefix matches and the timestamps step by roughly the
-0.5 s keyframe interval. The run is detected and the animation stops at its edge rather than
-cutting to a different city mid-video.
+On finding a run of consecutive frames
+-------------------------------------
+Index order is not time order. ``tools/prepare_nuscenes.py`` shards the sample list with
+``sample_tokens[shard::num_shards]``, so a merged annotation file interleaves shards: entry n
+and entry n+1 are usually seconds apart in a drive, or in different drives altogether. Walking
+the index and stopping at the first discontinuity therefore yields exactly one frame.
+
+The annotation file has no scene id either, but every sample's LiDAR filename carries the
+nuScenes log prefix and a microsecond timestamp
+(``n008-2018-08-01-15-16-36-0400__LIDAR_TOP__1533151603547590.pcd.bin``). That is enough to
+reconstruct the truth: group the samples by drive, sort each group by capture time, and take
+the longest stretch whose consecutive gaps are about the 0.5 s keyframe interval. The animation
+then covers real consecutive keyframes and stops at the end of the drive, wherever those
+samples happen to sit in the file.
 """
 
 from __future__ import annotations
@@ -105,6 +111,67 @@ def drive_and_timestamp(lidar_path: str) -> Optional[Tuple[str, int]]:
     if match is None:
         return None
     return match.group("drive"), int(match.group("ts"))
+
+
+def temporal_run(
+    entries: Sequence[Dict[str, Any]], max_frames: int, start: Optional[int] = None
+) -> List[int]:
+    """Indices of a genuinely consecutive stretch of one drive, returned in time order.
+
+    Index order is not time order, and assuming it was is what produced a one-frame
+    "animation". ``tools/prepare_nuscenes.py`` shards the sample list with
+    ``sample_tokens[shard::num_shards]``, so a merged annotation file interleaves shards: entry
+    n and entry n+1 are typically several seconds apart within a drive, or in different drives
+    altogether. Walking the index directly finds no neighbours at all -- which the boundary
+    check correctly reported rather than splicing unrelated frames together.
+
+    The run is therefore recovered from the timestamps: group every sample by its drive, sort
+    each group by capture time, and take the longest stretch whose consecutive gaps are within
+    a keyframe interval. Where those samples happen to sit in the annotation file does not
+    matter.
+
+    Args:
+        entries: The dataset's annotation entries.
+        max_frames: Cap on the number of frames returned.
+        start: Optional index to anchor on. When given and that sample belongs to a run, the
+            run is taken from there onward; otherwise the longest run in the split is used.
+
+    Returns:
+        Dataset indices in ascending time order. Falls back to a plain consecutive range when
+        filenames carry no timestamps (synthetic data), where there are no drives to respect.
+    """
+    stamped: List[Tuple[str, int, int]] = []
+    for i, entry in enumerate(entries):
+        paths = entry.get("points_paths") or []
+        got = drive_and_timestamp(paths[-1]) if paths else None
+        if got is not None:
+            stamped.append((got[0], got[1], i))
+
+    if not stamped:
+        begin = start or 0
+        return list(range(begin, min(begin + max_frames, len(entries))))
+
+    by_drive: Dict[str, List[Tuple[int, int]]] = {}
+    for drive, ts, i in stamped:
+        by_drive.setdefault(drive, []).append((ts, i))
+
+    runs: List[List[int]] = []
+    for frames in by_drive.values():
+        frames.sort()
+        current = [frames[0][1]]
+        for (prev_ts, _), (ts, idx) in zip(frames, frames[1:]):
+            if 0 < ts - prev_ts <= MAX_GAP_US:
+                current.append(idx)
+            else:
+                runs.append(current)
+                current = [idx]
+        runs.append(current)
+
+    if start is not None:
+        for run in runs:
+            if start in run:
+                return run[run.index(start):][:max_frames]
+    return max(runs, key=len)[:max_frames]
 
 
 def contiguous_run(entries: Sequence[Dict[str, Any]], start: int, max_frames: int) -> List[int]:
@@ -357,7 +424,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--dataset", default=None, choices=["synthetic", "cam4docc"])
     p.add_argument("--data-root", default=None)
     p.add_argument("--ann-file", default=None)
-    p.add_argument("--index", type=int, default=0, help="Sample to start from.")
+    p.add_argument("--index", type=int, default=None,
+                   help="Sample to render (figure/rollout) or to anchor on (temporal). "
+                        "Omit in temporal mode to use the longest continuous drive in the split.")
     p.add_argument("--max-frames", type=int, default=40, help="temporal mode: frame cap.")
     p.add_argument("--horizon", type=int, default=0,
                    help="temporal mode: which forecast horizon to display (0 = nearest).")
@@ -393,21 +462,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     out_dir = Path(args.out_dir)
     frames: List[Image.Image] = []
 
+    # figure and rollout address one sample, so an unspecified index means the first.
+    sample_index = 0 if args.index is None else args.index
+
     if args.mode == "figure":
-        if not 0 <= args.index < len(dataset):
-            print(f"[figure] --index {args.index} is outside the split (0..{len(dataset) - 1}).",
+        if not 0 <= sample_index < len(dataset):
+            print(f"[figure] --index {sample_index} is outside the split (0..{len(dataset) - 1}).",
                   file=sys.stderr)
             return 1
-        batch = collate_fn([dataset[args.index]])
+        batch = collate_fn([dataset[sample_index]])
         pred = _predict(model, batch, device, occ_size)
         gt = batch["gt_occ"][0].cpu().numpy().astype(np.int64)
         fig = render_rollout_figure(
-            gt, pred, 0.5, f"{cfg.name} — val sample {args.index} — {tag}"
+            gt, pred, 0.5, f"{cfg.name} — val sample {sample_index} — {tag}"
         )
         out_dir.mkdir(parents=True, exist_ok=True)
         written = []
         for ext in ("png", "pdf"):
-            path = out_dir / f"rollout_figure_{args.index:05d}.{ext}"
+            path = out_dir / f"rollout_figure_{sample_index:05d}.{ext}"
             # `tight` is right here and wrong for video frames: a static figure should be
             # trimmed to its content, and nothing depends on two of them matching in size.
             fig.savefig(path, dpi=300 if ext == "png" else None, bbox_inches="tight")
@@ -417,25 +489,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.mode == "rollout":
-        if not 0 <= args.index < len(dataset):
-            print(f"[video] --index {args.index} is outside the split (0..{len(dataset) - 1}).",
+        if not 0 <= sample_index < len(dataset):
+            print(f"[video] --index {sample_index} is outside the split (0..{len(dataset) - 1}).",
                   file=sys.stderr)
             return 1
-        batch = collate_fn([dataset[args.index]])
+        batch = collate_fn([dataset[sample_index]])
         pred = _predict(model, batch, device, occ_size)
         gt = batch["gt_occ"][0].cpu().numpy().astype(np.int64)
-        title = f"{cfg.name} — sample {args.index} — {tag}"
+        title = f"{cfg.name} — sample {sample_index} — {tag}"
         for t in range(gt.shape[0]):
             frames.append(_frame_to_image(render_rollout_frame(gt, pred, t, 0.5, title)))
             print(f"[video] horizon {t + 1}/{gt.shape[0]}")
-        stem = f"rollout_{args.index:05d}"
+        stem = f"rollout_{sample_index:05d}"
     else:
         entries = getattr(dataset, "_index", None) or [{}] * len(dataset)
-        indices = contiguous_run(entries, args.index, args.max_frames)
+        indices = temporal_run(entries, args.max_frames, args.index)
         if not indices:
-            print(f"[video] no frames from index {args.index}.", file=sys.stderr)
+            print("[video] found no frames to animate.", file=sys.stderr)
             return 1
-        print(f"[video] {len(indices)} frames in this drive: {indices[0]}..{indices[-1]}")
+        if len(indices) == 1:
+            print(
+                "[video] only one frame belongs to this run, so there is nothing to animate. "
+                "The annotation file is not in time order (tools/prepare_nuscenes.py shards "
+                "the sample list), and no drive in it has consecutive keyframes. Re-run "
+                "without --index to search the whole split.",
+                file=sys.stderr,
+            )
+        print(f"[video] {len(indices)} consecutive keyframes of one drive "
+              f"(samples {indices[0]}..{indices[-1]})")
         title = f"{cfg.name} — {tag}"
         for n, idx in enumerate(indices):
             batch = collate_fn([dataset[idx]])

@@ -28,6 +28,7 @@ from tools.make_video import (
     render_rollout_figure,
     render_rollout_frame,
     render_temporal_frame,
+    temporal_run,
     write_gif,
 )
 
@@ -99,6 +100,67 @@ class TestSceneBoundaries:
 
     def test_an_out_of_range_start_yields_nothing(self) -> None:
         assert contiguous_run(_run(DRIVE_A, 1_000_000_000, 3), 99, 10) == []
+
+
+class TestRunsAreFoundByTimeNotByIndex:
+    """The bug that produced a one-frame "animation" on the real split.
+
+    `tools/prepare_nuscenes.py` shards the sample list with `sample_tokens[shard::num_shards]`,
+    so the merged annotation file interleaves shards. Consecutive entries are seconds apart, or
+    in different drives, and walking the index finds no neighbours at all.
+    """
+
+    def _sharded(self, n_drives: int, per_drive: int, shards: int) -> list:
+        """An annotation file built the way the preprocessing actually builds one."""
+        ordered = []
+        for d in range(n_drives):
+            drive = f"n{d:03d}-2018-08-01-15-16-36-0400"
+            for k in range(per_drive):
+                ordered.append(_entry(drive, 1_000_000_000 + k * KEYFRAME_INTERVAL_US))
+        interleaved = []
+        for s in range(shards):
+            interleaved.extend(ordered[s::shards])
+        return interleaved
+
+    def test_a_sharded_index_still_yields_a_full_run(self) -> None:
+        """Index order gives one frame; timestamp order gives the whole drive."""
+        entries = self._sharded(n_drives=2, per_drive=20, shards=8)
+        assert len(contiguous_run(entries, 0, 40)) == 1, "precondition: the index is not in time order"
+        assert len(temporal_run(entries, 40)) == 20
+
+    def test_frames_come_back_in_time_order(self) -> None:
+        """Returned out of order, the animation would jump back and forth while looking
+        like a plausible video."""
+        entries = self._sharded(n_drives=1, per_drive=12, shards=4)
+        run = temporal_run(entries, 40)
+        stamps = [drive_and_timestamp(entries[i]["points_paths"][-1])[1] for i in run]
+        assert stamps == sorted(stamps)
+
+    def test_the_longest_drive_is_chosen(self) -> None:
+        entries = _run(DRIVE_A, 1_000_000_000, 4) + _run(DRIVE_B, 9_000_000_000, 11)
+        assert len(temporal_run(entries, 40)) == 11
+
+    def test_a_run_never_spans_two_drives(self) -> None:
+        entries = _run(DRIVE_A, 1_000_000_000, 6) + _run(DRIVE_B, 1_000_000_000, 6)
+        run = temporal_run(entries, 40)
+        drives = {drive_and_timestamp(entries[i]["points_paths"][-1])[0] for i in run}
+        assert len(drives) == 1, f"the animation crossed drives: {drives}"
+
+    def test_an_anchor_index_starts_the_run_there(self) -> None:
+        entries = _run(DRIVE_A, 1_000_000_000, 10)
+        assert temporal_run(entries, 40, start=4) == [4, 5, 6, 7, 8, 9]
+
+    def test_an_anchor_outside_any_run_falls_back_to_the_longest(self) -> None:
+        """A stale --index must not silently produce an empty video."""
+        entries = _run(DRIVE_A, 1_000_000_000, 5)
+        assert len(temporal_run(entries, 40, start=999)) == 5
+
+    def test_max_frames_still_caps_the_result(self) -> None:
+        assert len(temporal_run(_run(DRIVE_A, 1_000_000_000, 80), 12)) == 12
+
+    def test_synthetic_data_falls_back_to_index_order(self) -> None:
+        entries = [{"points_paths": ["sample_0.bin"]} for _ in range(10)]
+        assert temporal_run(entries, 4, start=2) == [2, 3, 4, 5]
 
 
 class TestFramesAreVideoSafe:
