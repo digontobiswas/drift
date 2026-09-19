@@ -43,8 +43,6 @@ NGPU="$(python -c 'import torch; print(torch.cuda.device_count())')"
 echo "[abl] task ${SLURM_ARRAY_TASK_ID:-0} -> config=$CONFIG"
 
 CKPT="$DRIFT_CKPT_DIR/$CONFIG/latest.pth"
-RESUME_ARG=()
-[[ -f "$CKPT" ]] && RESUME_ARG=(--resume "$CKPT") && echo "[abl] auto-resuming from $CKPT"
 
 # Baseline for the requeue decision below: "made progress" vs "died immediately".
 read -r START_EPOCH START_STEP < <(python tools/ckpt_info.py "$CKPT")
@@ -55,15 +53,32 @@ if [[ "$NGPU" -gt 1 ]]; then
     LAUNCH=(torchrun --standalone --nproc_per_node="$NGPU" tools/train.py --distributed)
 fi
 
+# The command line is built as ONE array, with --resume appended only when there is something
+# to resume from. The previous shape kept the resume flag in its own array and expanded it as
+# "${RESUME_ARG[@]}" -- harmless on a modern shell, fatal here: the compute nodes run
+# RHEL7-era bash 4.2, where expanding an EMPTY array under `set -u` raises "unbound variable"
+# instead of expanding to nothing (bash 4.4 fixed this). Every ablation starts with no
+# checkpoint, so all six array tasks died on that line inside a minute, before training began.
+# One always-non-empty array sidesteps the version difference without the cryptic
+# ${ARR[@]+"${ARR[@]}"} guard.
+TRAIN_CMD=(
+    "${LAUNCH[@]}"
+    --config "$CONFIG"
+    --epochs "$EPOCHS"
+    --batch-size "$BATCH_SIZE"
+    --num-workers "$(( ${SLURM_CPUS_PER_TASK:-8} / NGPU ))"
+    --device cuda
+    --log-interval 50
+)
+if [[ -f "$CKPT" ]]; then
+    TRAIN_CMD+=(--resume "$CKPT")
+    echo "[abl] auto-resuming from $CKPT"
+else
+    echo "[abl] no checkpoint at $CKPT -- starting $CONFIG from scratch"
+fi
+
 TRAIN_RC=0
-"${LAUNCH[@]}" \
-    --config "$CONFIG" \
-    --epochs "$EPOCHS" \
-    --batch-size "$BATCH_SIZE" \
-    --num-workers "$(( ${SLURM_CPUS_PER_TASK:-8} / NGPU ))" \
-    --device cuda \
-    --log-interval 50 \
-    "${RESUME_ARG[@]}" || TRAIN_RC=$?
+"${TRAIN_CMD[@]}" || TRAIN_RC=$?
 
 echo "[abl] $CONFIG exited with status $TRAIN_RC -> $DRIFT_CKPT_DIR/$CONFIG"
 
