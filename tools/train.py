@@ -103,6 +103,18 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     p.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
     p.add_argument("--amp", action="store_true", default=None)
     p.add_argument("--no-amp", dest="amp", action="store_false")
+    # Gradient checkpointing is on for every real preset because the 16 GB V100s need it, but
+    # it also hides faults: a checkpointed segment recomputes its forward during backward, so
+    # anything that goes wrong in there surfaces as a SIGSEGV inside the autograd engine with
+    # no usable traceback. Turning it off trades memory for a real Python exception naming the
+    # failing line -- that is how the fp16 overflow in the instance matcher was found. A flag
+    # rather than a config edit, so a diagnostic run can never be committed as the default.
+    p.add_argument("--grad-checkpoint", dest="grad_checkpoint", action="store_true", default=None)
+    p.add_argument(
+        "--no-grad-checkpoint", dest="grad_checkpoint", action="store_false",
+        help="Disable gradient checkpointing: more memory, but an undiagnosable SIGSEGV "
+             "during backward becomes a traceback that names the failing line.",
+    )
     p.add_argument("--ckpt-dir", type=str, default=None)
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--log-interval", type=int, default=None)
@@ -137,6 +149,8 @@ def build_config(args: argparse.Namespace) -> DriftConfig:
         cfg.train.device = args.device
     if args.amp is not None:
         cfg.train.amp = args.amp
+    if args.grad_checkpoint is not None:
+        cfg.model.grad_checkpoint = args.grad_checkpoint
     if args.ckpt_dir is not None:
         cfg.train.ckpt_dir = args.ckpt_dir
     if args.resume is not None:
