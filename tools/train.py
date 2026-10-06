@@ -709,6 +709,12 @@ def main(argv: Optional[list] = None) -> None:
             # enough to destroy a two-week run. Checking a single scalar costs nothing.
             if not torch.isfinite(total_loss):
                 nan_skips += 1
+                # backward() is what normally frees the autograd graph. Skipping it leaves
+                # the whole forward's activations alive until these names are rebound on the
+                # next iteration -- by which point the next forward has already allocated
+                # its own. Two full activation sets on a 16 GB card is an out-of-memory
+                # kill, which is how the first run with this guard died. Drop them here.
+                del outputs, losses, total_loss
                 optimizer.zero_grad(set_to_none=True)
                 if is_main and nan_skips in (1, 10, 100) or nan_skips % 1000 == 0:
                     print(
@@ -733,6 +739,9 @@ def main(argv: Optional[list] = None) -> None:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
                 if not torch.isfinite(grad_norm):
                     nan_skips += 1
+                    # backward() has already run here, so the graph is gone; only the
+                    # output tensors are still held.
+                    del outputs, losses, total_loss
                     optimizer.zero_grad(set_to_none=True)
                     if is_main:
                         print(
