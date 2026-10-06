@@ -39,6 +39,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -127,8 +128,38 @@ def _discovered_configs(rdir: Path) -> List[tuple]:
     return ordered
 
 
+def checkpoint_progress(checkpoint: str) -> "tuple[Optional[int], Optional[int]]":
+    """Pull ``(epoch, global_step)`` out of the checkpoint description ``tools/eval.py`` writes.
+
+    The description looks like::
+
+        /path/latest.pth.bak (epoch=3, step=89800, trained_config=cam4docc_gmo)
+
+    These end up as their own columns because a results table that silently mixes training
+    budgets is worse than one with a gap in it. An ablation trained for one epoch, placed
+    beside a full model trained for three, reads as an architectural result and is not one --
+    and the difference is invisible unless someone opens the checkpoint path and reads it.
+
+    Args:
+        checkpoint: The ``checkpoint`` string from an eval JSON.
+
+    Returns:
+        ``(epoch, step)``, either of which is ``None`` when the string does not carry it (a
+        ``--random-init`` smoke run, say).
+    """
+    def _grab(key: str) -> Optional[int]:
+        match = re.search(rf"\b{key}=(\d+)", checkpoint or "")
+        return int(match.group(1)) if match else None
+
+    return _grab("epoch"), _grab("step")
+
+
 def build_summary_rows(rdir: Path, configs: Sequence[tuple]) -> List[Dict[str, Any]]:
-    """One row per evaluated config: the numbers a results table leads with."""
+    """One row per evaluated config: the numbers a results table leads with.
+
+    Prints a warning when the rows do not share a training budget, since that is the one
+    defect in this file that looks exactly like a valid result.
+    """
     rows = []
     for name, desc in configs:
         data = _load(rdir / f"eval_{name}.json")
@@ -140,6 +171,7 @@ def build_summary_rows(rdir: Path, configs: Sequence[tuple]) -> List[Dict[str, A
         per_present = iou.get("per_class_present") or []
         per_future = iou.get("per_class_future") or []
         n_classes = len(per_present)
+        ckpt_epoch, ckpt_step = checkpoint_progress(data.get("checkpoint", ""))
         # Only a 3-class run is the GMO preset; on any other class count, index 2 means
         # something else entirely and must not be labelled GMO.
         is_gmo_preset = n_classes == GMO_PRESET_NUM_CLASSES
@@ -147,6 +179,8 @@ def build_summary_rows(rdir: Path, configs: Sequence[tuple]) -> List[Dict[str, A
             "config": name,
             "description": desc,
             "checkpoint": data.get("checkpoint", ""),
+            "ckpt_epoch": ckpt_epoch,
+            "ckpt_step": ckpt_step,
             "num_classes": n_classes,
             "num_samples": data.get("num_samples"),
             "num_batches": data.get("num_batches"),
@@ -163,7 +197,30 @@ def build_summary_rows(rdir: Path, configs: Sequence[tuple]) -> List[Dict[str, A
             "ece": ece.get("ece"),
             "ece_valid_voxels": ece.get("n_valid"),
         })
+    _warn_on_mixed_budgets(rows)
     return rows
+
+
+def _warn_on_mixed_budgets(rows: Sequence[Dict[str, Any]]) -> None:
+    """Say so, loudly, when the configs in one table were not trained for the same length.
+
+    This is the failure that motivated the columns above. Comparing a three-epoch full model
+    against one-epoch ablations attributes to the architecture a gap that training time
+    produced, and every individual number in the file is correct, so nothing else catches it.
+    """
+    steps = {r["ckpt_step"] for r in rows if r.get("ckpt_step") is not None}
+    if len(steps) <= 1:
+        return
+    print(
+        "[csv] WARNING: these configs were not trained for the same number of steps "
+        f"({', '.join(str(s) for s in sorted(steps))}). Comparing them as an ablation table "
+        "measures training budget as much as architecture. See the ckpt_epoch / ckpt_step "
+        "columns in summary.csv.",
+        file=sys.stderr,
+    )
+    for row in sorted(rows, key=lambda r: (r.get("ckpt_step") is None, r.get("ckpt_step") or 0)):
+        print(f"       {row['config']:<20} epoch={row['ckpt_epoch']} step={row['ckpt_step']}",
+              file=sys.stderr)
 
 
 def build_per_class_rows(rdir: Path, configs: Sequence[tuple]) -> List[Dict[str, Any]]:
@@ -399,6 +456,12 @@ the two in one column.
 
 {caveat}
 
+**Check `ckpt_epoch` / `ckpt_step` before comparing any two rows of `summary.csv`.** Rows are
+only an ablation table when they share a training budget. A model trained three epochs beside
+ablations trained one will look like an architectural result and is not one -- every number is
+correct, only the comparison is invalid. `tools/results_to_csv.py` prints a warning when the
+rows disagree, but the columns are there so the table can be checked at a glance afterwards.
+
 `per_horizon_iou.csv`'s buckets are **cumulative**: bucket k pools every future frame out to
 horizon k, which is the Cam4DOcc convention, so the curve is a running average and not a
 per-frame score.
@@ -440,7 +503,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     written: List[str] = []
     for filename, fields, rows in [
         ("summary.csv",
-         ["config", "description", "checkpoint", "num_classes", "num_samples", "num_batches",
+         ["config", "description", "checkpoint", "ckpt_epoch", "ckpt_step", "num_classes",
+          "num_samples", "num_batches",
           "elapsed_s", "IOU_mean", "IoU_c", "IoU_f", "gmo_iou_present", "gmo_iou_future",
           "flow_epe_m", "flow_angular_error_rad", "flow_magnitude_error_m", "flow_valid_voxels",
           "ece", "ece_valid_voxels"],

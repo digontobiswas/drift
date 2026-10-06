@@ -124,6 +124,22 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     )
     p.add_argument("--max-iters", type=int, default=None, help="Stop after this many optimizer steps (debug/CI).")
     p.add_argument("--distributed", action="store_true", default=False)
+    p.add_argument(
+        "--nan-policy", choices=["recover", "abort"], default="recover",
+        help="What to do when the weights go non-finite mid-run. 'recover' reloads the last "
+             "good checkpoint and carries on; 'abort' stops so a person can look.",
+    )
+    p.add_argument(
+        "--inject-nan-at-step", type=int, default=None,
+        help="VERIFICATION ONLY: deliberately poison the weights at this step, to watch the "
+             "guard refuse the save and the rollback happen on real hardware. Never use for "
+             "a run whose numbers matter.",
+    )
+    p.add_argument(
+        "--max-nan-recoveries", type=int, default=3,
+        help="Give up after this many weight rollbacks, so a run that is reliably producing "
+             "NaN cannot loop on the GPU for days.",
+    )
     return p.parse_args(argv)
 
 
@@ -367,12 +383,87 @@ def set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
         group["lr"] = lr
 
 
+def _scan_finite(state: dict, label: str) -> "tuple[Optional[str], float, int]":
+    """Check every float tensor in a state dict and report what was found.
+
+    Returns ``(bad_name, max_abs, n_checked)``: the name of the first non-finite tensor or
+    None, the largest magnitude seen among the finite ones, and how many tensors were
+    examined. The last two exist so the guard can say what it did on a *successful* save --
+    a check that only ever speaks when it fails is indistinguishable from a check that is
+    not running, which is no reassurance at all before a two-week run.
+
+    ``max_abs`` is also an early warning in its own right: weights climbing toward fp16's
+    65504 ceiling are the shape of the overflow that preceded the last NaN event, visible
+    some time before anything actually becomes non-finite.
+    """
+    worst = [0.0]
+    count = [0]
+
+    def walk(obj, name):
+        if torch.is_tensor(obj):
+            if obj.is_floating_point():
+                count[0] += 1
+                finite = torch.isfinite(obj)
+                if not finite.all():
+                    return name
+                if obj.numel():
+                    worst[0] = max(worst[0], float(obj.abs().max()))
+            return None
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                found = walk(value, f"{name}.{key}")
+                if found:
+                    return found
+        elif isinstance(obj, (list, tuple)):
+            for i, value in enumerate(obj):
+                found = walk(value, f"{name}[{i}]")
+                if found:
+                    return found
+        return None
+
+    bad = walk(state, label)
+    return bad, worst[0], count[0]
+
+
+def _first_non_finite(state: dict, label: str) -> "Optional[str]":
+    """Name the first tensor in a state dict holding a NaN or Inf, or return None.
+
+    Walks nested containers because an optimizer's state is keyed by parameter id and
+    holds its moment buffers one level down.
+
+    Args:
+        state: A model or optimizer ``state_dict``.
+        label: Prefix for the reported name, so the message says which dict it came from.
+
+    Returns:
+        ``"<label>.<key>"`` of the first offending tensor, or ``None`` if all are finite.
+    """
+    def walk(obj, name):
+        if torch.is_tensor(obj):
+            if obj.is_floating_point() and not torch.isfinite(obj).all():
+                return name
+            return None
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                found = walk(value, f"{name}.{key}")
+                if found:
+                    return found
+        elif isinstance(obj, (list, tuple)):
+            for i, value in enumerate(obj):
+                found = walk(value, f"{name}[{i}]")
+                if found:
+                    return found
+        return None
+
+    return walk(state, label)
+
+
 def save_checkpoint(
     path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
     epoch: int, global_step: int, cfg: DriftConfig, batch_in_epoch: int = 0,
     world_size: int = 1,
-) -> None:
-    """Write a resumable checkpoint.
+) -> bool:
+    """Write a resumable checkpoint, unless the weights have gone non-finite.
 
     `epoch` is the epoch to RESUME AT, and `batch_in_epoch` how far into it this
     snapshot is (0 = start of the epoch). An epoch-end save therefore passes
@@ -391,14 +482,42 @@ def save_checkpoint(
     on 1 GPU without accounting for that lands half way to where it should. Runs here
     switch GPU count often, because the queue hands out single free GPUs far sooner
     than pairs.
+
+    **A non-finite model or optimizer is never written.** A twelve-epoch run here ended
+    with every one of its 587 weight tensors NaN, and because an epoch boundary writes
+    `epoch_N.pth` and `latest.pth` from the same weights, both copies of the last good
+    state were overwritten in the same breath. Two weeks of training were recoverable
+    only from an unrelated backup four epochs earlier. Checking before the write costs
+    about a second and makes that particular loss impossible: whatever goes wrong, the
+    newest file on disk is still a model that can be resumed from.
+
+    Returns:
+        True if the checkpoint was written, False if it was refused as non-finite. A
+        caller that gets False should stop: once the weights are NaN every subsequent
+        step is wasted, and ending the job leaves the last good checkpoint in place.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+    model_state = raw_model.state_dict()
+    optimizer_state = optimizer.state_dict()
+
+    bad_m, max_m, n_m = _scan_finite(model_state, "model")
+    bad_o, max_o, n_o = _scan_finite(optimizer_state, "optimizer")
+    bad = bad_m or bad_o
+    if bad is not None:
+        print(
+            f"[train] !! REFUSING to write {path.name}: {bad} contains NaN or Inf at "
+            f"epoch={epoch} step={global_step}. The previous checkpoint is left intact; "
+            "training cannot recover from here and should be restarted from it.",
+            file=sys.stderr, flush=True,
+        )
+        return False
+
     tmp = path.with_name(path.name + ".tmp")
     torch.save(
         {
-            "model": raw_model.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "model": model_state,
+            "optimizer": optimizer_state,
             "epoch": epoch,
             "global_step": global_step,
             "batch_in_epoch": batch_in_epoch,
@@ -408,6 +527,15 @@ def save_checkpoint(
         tmp,
     )
     os.replace(tmp, path)
+    # Say so on success, not only on failure. This line is the evidence that the guard ran
+    # at all; without it, a silent save is the same observation whether the check is
+    # working or has been accidentally removed.
+    print(
+        f"[train] finiteness check passed: {n_m + n_o} tensors, max |w| = {max_m:.4g}, "
+        f"max |opt| = {max_o:.4g} -> wrote {path.name}",
+        flush=True,
+    )
+    return True
 
 
 def load_checkpoint(
@@ -528,6 +656,12 @@ def main(argv: Optional[list] = None) -> None:
 
     stop = False
     interrupted = False  # set when a walltime signal ends the run, vs. a clean finish
+    # Batches whose loss or gradients came back non-finite and were skipped, and times the
+    # weights themselves had to be rolled back from disk. Both are reported at the end: a
+    # run that finishes having skipped thousands of batches trained on less data than the
+    # config claims, and that belongs in the log rather than inferred later from a gap.
+    nan_skips = 0
+    nan_recoveries = 0
     for epoch in range(start_epoch, cfg.train.epochs):
         model.train()
         t0 = time.time()
@@ -567,6 +701,24 @@ def main(argv: Optional[list] = None) -> None:
                 losses = raw_model.loss(outputs, batch)
                 total_loss = sum(losses.values())
 
+            # First line of defence, and the cheapest: a non-finite loss is skipped before
+            # it can reach the weights. Under AMP the GradScaler would also skip the step
+            # once the gradients came back non-finite, but without AMP nothing does --
+            # backward produces NaN gradients, clip_grad_norm_ scales them by a NaN norm,
+            # and optimizer.step() writes NaN into every parameter. One bad batch is then
+            # enough to destroy a two-week run. Checking a single scalar costs nothing.
+            if not torch.isfinite(total_loss):
+                nan_skips += 1
+                optimizer.zero_grad(set_to_none=True)
+                if is_main and nan_skips in (1, 10, 100) or nan_skips % 1000 == 0:
+                    print(
+                        f"[train] non-finite loss at epoch={epoch} it={it} "
+                        f"step={global_step}; skipping this batch "
+                        f"({nan_skips} skipped so far)",
+                        flush=True,
+                    )
+                continue
+
             if use_amp:
                 scaler.scale(total_loss).backward()
                 scaler.unscale_(optimizer)
@@ -575,10 +727,37 @@ def main(argv: Optional[list] = None) -> None:
                 scaler.update()
             else:
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+                # Without AMP there is no GradScaler to veto a bad step, so the gradient
+                # norm is the veto: clip_grad_norm_ returns it, and a non-finite norm means
+                # every gradient is already poisoned.
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+                if not torch.isfinite(grad_norm):
+                    nan_skips += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    if is_main:
+                        print(
+                            f"[train] non-finite gradient norm at step={global_step}; "
+                            f"skipping this step ({nan_skips} skipped so far)",
+                            flush=True,
+                        )
+                    continue
                 optimizer.step()
 
             global_step += 1
+
+            # Deliberate corruption, for proving the guard works where it matters: on the
+            # cluster, with the real model, before committing two weeks to a run. Off unless
+            # explicitly asked for.
+            if args.inject_nan_at_step is not None and global_step == args.inject_nan_at_step:
+                with torch.no_grad():
+                    raw = model.module if isinstance(model, DistributedDataParallel) else model
+                    next(iter(raw.parameters())).fill_(float("nan"))
+                print(
+                    f"[train] --inject-nan-at-step: poisoned the first parameter at "
+                    f"step={global_step}. The next checkpoint save must refuse to write.",
+                    flush=True,
+                )
+
             if is_main and (it % max(cfg.train.log_interval, 1) == 0):
                 loss_str = " ".join(f"{k}={v.item():.4f}" for k, v in losses.items())
                 elapsed = time.time() - t0
@@ -596,10 +775,41 @@ def main(argv: Optional[list] = None) -> None:
             # resume re-enters this epoch and fast-forwards, rather than skipping ahead.
             ckpt_every = getattr(cfg.train, "ckpt_interval_steps", 0)
             if is_main and ckpt_every and global_step % ckpt_every == 0:
-                save_checkpoint(
+                if not save_checkpoint(
                     ckpt_dir / "latest.pth", model, optimizer, epoch, global_step, cfg,
                     batch_in_epoch=it + 1, world_size=world_size,
-                )
+                ):
+                    # The weights are gone. They cannot be repaired in place, so the only
+                    # way forward is the last checkpoint on disk -- which is guaranteed
+                    # finite, because save_checkpoint has never written anything else.
+                    nan_recoveries += 1
+                    last_good = ckpt_dir / "latest.pth"
+                    if args.nan_policy == "abort" or nan_recoveries > args.max_nan_recoveries:
+                        raise SystemExit(
+                            f"[train] aborting after {nan_recoveries} non-finite weight "
+                            f"event(s) (limit {args.max_nan_recoveries}, policy "
+                            f"{args.nan_policy}). {last_good} is intact and resumable."
+                        )
+                    if not last_good.exists():
+                        raise SystemExit(
+                            "[train] weights went non-finite before any checkpoint existed, "
+                            "so there is nothing to roll back to."
+                        )
+                    load_checkpoint(str(last_good), model, optimizer, device,
+                                    world_size=world_size)
+                    if use_amp:
+                        # The scaler's loss scale is what drove the overflow; restarting it
+                        # from the default backs off instead of diving straight back in.
+                        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+                    print(
+                        f"[train] recovered from non-finite weights at step={global_step} "
+                        f"by reloading {last_good} (recovery {nan_recoveries} of "
+                        f"{args.max_nan_recoveries}). Training continues from the next "
+                        "batch; the weights are those of the last checkpoint, so a little "
+                        "progress is lost but the run is not.",
+                        flush=True,
+                    )
+                    continue
                 print(
                     f"[train] checkpoint saved at epoch={epoch} it={it} step={global_step}",
                     flush=True,
@@ -641,15 +851,29 @@ def main(argv: Optional[list] = None) -> None:
                     flush=True,
                 )
             else:
-                save_checkpoint(
+                # Both files are written from the same weights, which is exactly how one
+                # NaN epoch destroyed `epoch_11.pth` and `latest.pth` together. If the
+                # first is refused the second must not be attempted.
+                wrote = save_checkpoint(
                     ckpt_dir / f"epoch_{epoch}.pth", model, optimizer, epoch + 1, global_step, cfg,
                     batch_in_epoch=0, world_size=world_size,
                 )
-                save_checkpoint(
-                    ckpt_dir / "latest.pth", model, optimizer, epoch + 1, global_step, cfg,
-                    batch_in_epoch=0, world_size=world_size,
-                )
-                print(f"[train] epoch {epoch} done in {time.time() - t0:.1f}s, checkpoint saved to {ckpt_dir}")
+                if wrote:
+                    save_checkpoint(
+                        ckpt_dir / "latest.pth", model, optimizer, epoch + 1, global_step, cfg,
+                        batch_in_epoch=0, world_size=world_size,
+                    )
+                    print(f"[train] epoch {epoch} done in {time.time() - t0:.1f}s, checkpoint saved to {ckpt_dir}")
+                else:
+                    # Nothing was overwritten, so latest.pth still holds the last good
+                    # state. Ending here is right even under the recovery policy: an epoch
+                    # boundary is the one place where simply continuing would roll into the
+                    # next epoch with weights that are already known to be broken.
+                    raise SystemExit(
+                        "[train] aborting at the end of epoch "
+                        f"{epoch}: weights went non-finite, so neither epoch_{epoch}.pth "
+                        f"nor latest.pth was overwritten. Resume from {ckpt_dir}/latest.pth."
+                    )
 
         if stop:
             break
@@ -659,7 +883,13 @@ def main(argv: Optional[list] = None) -> None:
         dist.destroy_process_group()
 
     if is_main:
-        print("[train] finished.")
+        # Reported unconditionally, zeros included. "0 batches skipped" is a result worth
+        # seeing in the log of a run whose numbers go into a paper; silence would leave a
+        # reader unable to tell a clean run from one that simply never counted.
+        print(
+            f"[train] finished. non-finite batches skipped: {nan_skips}; "
+            f"weight rollbacks: {nan_recoveries}."
+        )
 
 
 if __name__ == "__main__":

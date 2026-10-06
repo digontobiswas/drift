@@ -253,3 +253,56 @@ class TestEndToEnd:
 
     def test_a_missing_results_dir_fails_loudly(self, tmp_path) -> None:
         assert main(["--results-dir", str(tmp_path / "nope")]) == 1
+
+
+class TestTrainingBudgetIsVisible:
+    """A table that silently mixes training budgets is the defect most likely to be believed.
+
+    Three one-epoch ablations were once placed beside a three-epoch full model, and every
+    ablation appeared to beat it -- an apparent finding that every component in the
+    architecture hurts. The numbers were all correct; only the comparison was not. Nothing in
+    the file said so, because the only trace of the difference was buried inside a checkpoint
+    path string.
+    """
+
+    def test_epoch_and_step_are_parsed_into_their_own_columns(self, tmp_path) -> None:
+        row = build_summary_rows(_eval_json(tmp_path), CONFIGS)[0]
+        assert row["ckpt_epoch"] == 12
+        assert row["ckpt_step"] == 270360
+
+    def test_a_checkpoint_without_progress_info_leaves_the_columns_empty(self, tmp_path) -> None:
+        """A --random-init smoke run has no epoch. Blank says "unknown"; 0 would say
+        "untrained", which is a different and wrong claim."""
+        rdir = _eval_json(tmp_path)
+        payload = json.loads((rdir / "eval_cam4docc_gmo.json").read_text())
+        payload["checkpoint"] = "random-init (smoke test)"
+        (rdir / "eval_cam4docc_gmo.json").write_text(json.dumps(payload))
+        row = build_summary_rows(rdir, CONFIGS)[0]
+        assert row["ckpt_epoch"] is None and row["ckpt_step"] is None
+
+    def test_mixed_budgets_are_reported_on_stderr(self, tmp_path, capsys) -> None:
+        """The active guard: building the table at all prints the warning."""
+        rdir = _eval_json(tmp_path)
+        _eval_json(rdir, config="no_cmli")
+        payload = json.loads((rdir / "eval_no_cmli.json").read_text())
+        payload["checkpoint"] = "/runs/no_cmli/latest.pth (epoch=1, step=22530)"
+        (rdir / "eval_no_cmli.json").write_text(json.dumps(payload))
+
+        build_summary_rows(rdir, CONFIGS)
+        err = capsys.readouterr().err
+        assert "not trained for the same number of steps" in err
+        assert "22530" in err and "270360" in err
+
+    def test_a_matched_table_says_nothing(self, tmp_path, capsys) -> None:
+        """The warning has to stay rare, or it becomes noise people scroll past."""
+        rdir = _eval_json(tmp_path)
+        _eval_json(rdir, config="no_cmli")
+        build_summary_rows(rdir, CONFIGS)
+        assert "not trained for the same" not in capsys.readouterr().err
+
+    def test_the_columns_reach_the_written_file(self, tmp_path) -> None:
+        rdir = _eval_json(tmp_path / "results")
+        out = tmp_path / "csv"
+        assert main(["--results-dir", str(rdir), "--out-dir", str(out)]) == 0
+        row = _read(out / "summary.csv")[0]
+        assert row["ckpt_epoch"] == "12" and row["ckpt_step"] == "270360"
