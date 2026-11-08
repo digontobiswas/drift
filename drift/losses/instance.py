@@ -16,6 +16,7 @@ fields is duck-typed.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -233,6 +234,12 @@ def instance_loss(
     """
     if len(states) == 0:
         raise ValueError("states must be a non-empty list of InstanceState")
+    # Every prediction to fp32 before any loss arithmetic. The cost matrix was already
+    # computed in fp32 (see `_box_cost_matrix`), but the loss terms themselves consumed the
+    # raw fp16 predictions -- and `_score_to_logit` on an fp16 score is non-finite for any
+    # confidently-detected query (see there). The tensors are (B, Q, small), so this costs
+    # nothing.
+    states = [_states_to_fp32(st) for st in states]
     T_o = len(states)
     if point_cloud_range is None:
         point_cloud_range = DEFAULT_PC_RANGE
@@ -337,6 +344,19 @@ def instance_loss(
     }
 
 
+def _states_to_fp32(state: "InstanceState") -> "InstanceState":
+    """Copy of `state` with every floating-point field cast to fp32."""
+    return dataclasses.replace(
+        state,
+        **{
+            f.name: getattr(state, f.name).float()
+            for f in dataclasses.fields(state)
+            if torch.is_tensor(getattr(state, f.name))
+            and getattr(state, f.name).is_floating_point()
+        },
+    )
+
+
 def _score_to_logit(score: Tensor, eps: float = 1e-4) -> Tensor:
     """Treat `InstanceState.score` (in `[0,1]`) as a probability and recover its logit.
 
@@ -347,6 +367,14 @@ def _score_to_logit(score: Tensor, eps: float = 1e-4) -> Tensor:
     logit or a sigmoid-activated score; when `score` is already outside
     `(0,1)` (i.e. it *was* a raw logit) this is a no-op modulo the clamp.
     """
+    # fp32 is load-bearing here, not a nicety. In fp16 `1.0 - 1e-4` rounds to exactly 1.0,
+    # so the upper clamp does nothing; and a sigmoid with input above 8.32 also rounds
+    # to exactly 1.0. Any query the model is confident about (p > 0.99976 -- an ordinary
+    # confident detection) then gives log(1 / 0) = +Inf, and BCE-with-logits on +Inf is
+    # +Inf for an unmatched query and NaN for a matched one. Once a model is trained far
+    # enough to be confident somewhere in most batches, nearly every batch's total loss is
+    # non-finite -- in fp16 only; in fp32 the same score clamps to 0.9999 and gives 9.21.
+    score = score.float()
     s = score.clamp(eps, 1.0 - eps)
     if bool(((score < 0) | (score > 1)).any()):
         return score

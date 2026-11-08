@@ -13,6 +13,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from drift.utils.precision import graph_zero
+
 __all__ = ["flow_loss"]
 
 _IGNORE_VALUE = 255.0
@@ -53,7 +55,7 @@ def flow_loss(
     n_valid = int(valid.sum().item())
     if n_valid == 0:
         # NaN guard: keep the graph connected to `pred` with an exact-zero loss.
-        return pred.sum() * 0.0
+        return graph_zero(pred)
 
     valid_c = valid.unsqueeze(2).expand_as(pred)
     pred_valid = pred.masked_select(valid_c)

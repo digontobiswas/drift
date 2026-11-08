@@ -22,6 +22,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from drift.utils.precision import graph_zero
+
 __all__ = [
     "occupancy_loss",
     "downsample_target",
@@ -86,7 +88,7 @@ def CE_ssc_loss(
     logits_flat, target_flat = _flatten_logits_and_target(pred, target)
     valid = target_flat != ignore_index
     if not bool(valid.any()):
-        return pred.sum() * 0.0
+        return graph_zero(pred)
     weight = class_weights.to(dtype=logits_flat.dtype, device=logits_flat.device) if class_weights is not None else None
     return F.cross_entropy(logits_flat, target_flat, weight=weight, ignore_index=ignore_index, reduction="mean")
 
@@ -116,7 +118,7 @@ def _lovasz_softmax_flat(probas: Tensor, labels: Tensor, classes: str = "present
         Scalar loss tensor.
     """
     if probas.numel() == 0:
-        return probas.sum() * 0.0
+        return graph_zero(probas)
     num_classes = probas.shape[1]
     losses: List[Tensor] = []
     for c in range(num_classes):
@@ -130,7 +132,7 @@ def _lovasz_softmax_flat(probas: Tensor, labels: Tensor, classes: str = "present
         grad = _lovasz_grad(fg_sorted)
         losses.append(torch.dot(errors_sorted, grad))
     if not losses:
-        return probas.sum() * 0.0
+        return graph_zero(probas)
     return torch.stack(losses).mean()
 
 
@@ -154,7 +156,7 @@ def lovasz_softmax(
     logits_flat, target_flat = _flatten_logits_and_target(pred, target)
     valid = target_flat != ignore_index
     if not bool(valid.any()):
-        return pred.sum() * 0.0
+        return graph_zero(pred)
     probas = F.softmax(logits_flat[valid], dim=1)
     return _lovasz_softmax_flat(probas, target_flat[valid], classes=classes)
 
@@ -175,7 +177,7 @@ def geo_scal_loss(pred: Tensor, target: Tensor, ignore_index: int = _IGNORE_INDE
     logits_flat, target_flat = _flatten_logits_and_target(pred, target)
     valid = target_flat != ignore_index
     if not bool(valid.any()):
-        return pred.sum() * 0.0
+        return graph_zero(pred)
     probs = F.softmax(logits_flat[valid], dim=1)
     empty_probs = probs[:, 0]
     nonempty_probs = 1.0 - empty_probs
@@ -213,7 +215,7 @@ def sem_scal_loss(pred: Tensor, target: Tensor, ignore_index: int = _IGNORE_INDE
     logits_flat, target_flat = _flatten_logits_and_target(pred, target)
     valid = target_flat != ignore_index
     if not bool(valid.any()):
-        return pred.sum() * 0.0
+        return graph_zero(pred)
     probs = F.softmax(logits_flat[valid], dim=1)
     labels = target_flat[valid]
     num_classes = probs.shape[1]
@@ -227,7 +229,7 @@ def sem_scal_loss(pred: Tensor, target: Tensor, ignore_index: int = _IGNORE_INDE
         if float(n_pos) == 0.0:
             continue
         nominator = (p * completion_target).sum()
-        loss_class = probs.sum() * 0.0
+        loss_class = graph_zero(probs)
         p_sum = p.sum()
         if float(p_sum.detach()) > 0.0:
             precision = nominator / p_sum.clamp_min(eps)
@@ -240,7 +242,7 @@ def sem_scal_loss(pred: Tensor, target: Tensor, ignore_index: int = _IGNORE_INDE
             loss_class = loss_class - torch.log(specificity.clamp_min(eps))
         losses.append(loss_class)
     if not losses:
-        return probs.sum() * 0.0
+        return graph_zero(probs)
     return torch.stack(losses).mean()
 
 

@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from drift.models.encoders.camera_params import CameraParams
+from drift.utils.precision import full_precision
 
 __all__ = ["CameraEncoder"]
 
@@ -251,21 +252,33 @@ class CameraEncoder(nn.Module):
         """
         B, T, N = cam_params.rots.shape[:3]
         D, Hf, Wf, _ = frustum.shape
-        pts = frustum.view(1, 1, 1, D, Hf, Wf, 3).expand(B, T, N, D, Hf, Wf, 3)
 
-        post_trans = cam_params.post_trans.view(B, T, N, 1, 1, 1, 3)
-        post_rots_inv = torch.inverse(cam_params.post_rots).view(B, T, N, 1, 1, 1, 3, 3)
-        pts = pts - post_trans
-        pts = (post_rots_inv @ pts.unsqueeze(-1)).squeeze(-1)
+        # Always fp32, whatever the caller's autocast state. The matmuls below are on
+        # autocast's fp16 list, and the homogenising product `u * depth` reaches
+        # 1598 px * 72.4 m = 115,695 for the right-hand edge of a 1600-px nuScenes frame
+        # at the far depth bin -- past fp16's 65504. Those points became Inf, then NaN
+        # after the rotation, and were silently dropped by `_voxelize`'s range check:
+        # under AMP the far right of every camera image never reached the voxel grid,
+        # while fp32 evaluation lifted it correctly, so training and evaluation saw
+        # different geometry. The final coordinates are metres within +-51.2 and fit
+        # fp16 comfortably; only the intermediate overflows. Same class of bug as the
+        # fp32 inversions in `ego_motion.py` and `static_path.py`.
+        with full_precision(frustum.device.type):
+            pts = frustum.float().view(1, 1, 1, D, Hf, Wf, 3).expand(B, T, N, D, Hf, Wf, 3)
 
-        # Multiply (u, v) by depth to homogenize; leave depth channel as-is.
-        pts = torch.cat([pts[..., :2] * pts[..., 2:3], pts[..., 2:3]], dim=-1)
+            post_trans = cam_params.post_trans.float().view(B, T, N, 1, 1, 1, 3)
+            post_rots_inv = torch.inverse(cam_params.post_rots.float()).view(B, T, N, 1, 1, 1, 3, 3)
+            pts = pts - post_trans
+            pts = (post_rots_inv @ pts.unsqueeze(-1)).squeeze(-1)
 
-        intrins_inv = torch.inverse(cam_params.intrins).view(B, T, N, 1, 1, 1, 3, 3)
-        rots = cam_params.rots.view(B, T, N, 1, 1, 1, 3, 3)
-        combine = rots @ intrins_inv
-        pts = (combine @ pts.unsqueeze(-1)).squeeze(-1)
-        pts = pts + cam_params.trans.view(B, T, N, 1, 1, 1, 3)
+            # Multiply (u, v) by depth to homogenize; leave depth channel as-is.
+            pts = torch.cat([pts[..., :2] * pts[..., 2:3], pts[..., 2:3]], dim=-1)
+
+            intrins_inv = torch.inverse(cam_params.intrins.float()).view(B, T, N, 1, 1, 1, 3, 3)
+            rots = cam_params.rots.float().view(B, T, N, 1, 1, 1, 3, 3)
+            combine = rots @ intrins_inv
+            pts = (combine @ pts.unsqueeze(-1)).squeeze(-1)
+            pts = pts + cam_params.trans.float().view(B, T, N, 1, 1, 1, 3)
         return pts
 
     def _voxelize(self, points: Tensor, volume: Tensor) -> Tensor:

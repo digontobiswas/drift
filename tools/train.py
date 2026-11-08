@@ -86,6 +86,7 @@ from configs.base import DriftConfig
 from drift.data.cam4docc_dataset import Cam4DOccDataset, SyntheticOccDataset
 from drift.data.collate import collate_fn
 from drift.models.drift import DRIFT
+from drift.utils.activation_monitor import ActivationMonitor
 from drift.utils.seed import seed_everything
 
 
@@ -139,6 +140,18 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         "--max-nan-recoveries", type=int, default=3,
         help="Give up after this many weight rollbacks, so a run that is reliably producing "
              "NaN cannot loop on the GPU for days.",
+    )
+    p.add_argument(
+        "--detect-nonfinite", action="store_true", default=False,
+        help="DIAGNOSTIC: hook every module and, on a non-finite loss, name the first module "
+             "whose output went non-finite; print the modules closest to the fp16 limit at "
+             "the end. Slows training -- use with --max-batches for a short run.",
+    )
+    p.add_argument(
+        "--max-batches", type=int, default=None,
+        help="Stop after this many batches in THIS run, counting skipped ones. Unlike "
+             "--max-iters (an absolute optimizer-step count, which never advances while every "
+             "batch is being skipped), this always terminates.",
     )
     return p.parse_args(argv)
 
@@ -662,6 +675,11 @@ def main(argv: Optional[list] = None) -> None:
     # config claims, and that belongs in the log rather than inferred later from a gap.
     nan_skips = 0
     nan_recoveries = 0
+    batches_seen = 0
+    monitor = None
+    if args.detect_nonfinite and is_main:
+        monitor = ActivationMonitor(model.module if isinstance(model, DistributedDataParallel) else model)
+        print("[train] --detect-nonfinite: watching every module output for overflow.", flush=True)
     for epoch in range(start_epoch, cfg.train.epochs):
         model.train()
         t0 = time.time()
@@ -685,7 +703,13 @@ def main(argv: Optional[list] = None) -> None:
         # which is what an epoch that was already finished looks like.
         it = skip_batches - 1
         for local_it, batch in enumerate(epoch_loader):
+            if args.max_batches is not None and batches_seen >= args.max_batches:
+                stop = True
+                break
+            batches_seen += 1
             it = skip_batches + local_it
+            if monitor is not None:
+                monitor.start_batch()
             samples = in_flight_samples(order, it, cfg.data.batch_size)
             if is_main:
                 record_in_flight(ckpt_dir / "in_flight.txt", epoch, it, global_step, samples)
@@ -709,6 +733,16 @@ def main(argv: Optional[list] = None) -> None:
             # enough to destroy a two-week run. Checking a single scalar costs nothing.
             if not torch.isfinite(total_loss):
                 nan_skips += 1
+                verbose = monitor is not None or nan_skips in (1, 10, 100) or nan_skips % 1000 == 0
+                if is_main and verbose:
+                    # Which term, not just "the loss": only computed on this rare path, so the
+                    # per-term host syncs cost nothing on a healthy run.
+                    bad_terms = ", ".join(
+                        f"{k}={v.item():.4g}" for k, v in losses.items() if not torch.isfinite(v)
+                    )
+                    print(f"[train] non-finite loss terms: {bad_terms or '(none individually)'}", flush=True)
+                    if monitor is not None:
+                        print(monitor.describe_first_non_finite(), flush=True)
                 # backward() is what normally frees the autograd graph. Skipping it leaves
                 # the whole forward's activations alive until these names are rebound on the
                 # next iteration -- by which point the next forward has already allocated
@@ -716,7 +750,7 @@ def main(argv: Optional[list] = None) -> None:
                 # kill, which is how the first run with this guard died. Drop them here.
                 del outputs, losses, total_loss
                 optimizer.zero_grad(set_to_none=True)
-                if is_main and nan_skips in (1, 10, 100) or nan_skips % 1000 == 0:
+                if is_main and verbose:
                     print(
                         f"[train] non-finite loss at epoch={epoch} it={it} "
                         f"step={global_step}; skipping this batch "
@@ -773,7 +807,9 @@ def main(argv: Optional[list] = None) -> None:
                 print(
                     f"[train] epoch={epoch} it={it} step={global_step} "
                     f"sample={','.join(str(s) for s in samples)} lr={current_lr:.3e} "
-                    f"total_loss={total_loss.item():.4f} {loss_str} ({elapsed:.1f}s)",
+                    f"total_loss={total_loss.item():.4f} {loss_str}"
+                    + (f" amp_scale={scaler.get_scale():.4g}" if use_amp else "")
+                    + f" ({elapsed:.1f}s)",
                     flush=True,
                 )
 
@@ -899,6 +935,9 @@ def main(argv: Optional[list] = None) -> None:
             f"[train] finished. non-finite batches skipped: {nan_skips}; "
             f"weight rollbacks: {nan_recoveries}."
         )
+        if monitor is not None:
+            print(monitor.describe_headroom(), flush=True)
+            monitor.remove()
 
 
 if __name__ == "__main__":

@@ -17,6 +17,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from drift.utils.precision import graph_zero
+
 __all__ = ["uncertainty_nll"]
 
 _IGNORE_INDEX = 255
@@ -63,7 +65,7 @@ def uncertainty_nll(
     valid = target != ignore_index
     n_valid = valid.sum()
     if int(n_valid.item()) == 0:
-        return logits.sum() * 0.0 + log_var.sum() * 0.0
+        return graph_zero(logits, log_var)
 
     ce = F.cross_entropy(
         logits.reshape(B * T, C, *spatial),

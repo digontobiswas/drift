@@ -218,6 +218,34 @@ Common failures on this cluster:
 | `annotation file not found` | Preprocessing incomplete | Run `tools/merge_shards.py` for that split |
 | `AttributeError: np.bool` | numpy ≥ 1.24 with old third-party code | Already pinned `<2.0`; replace the alias with plain `bool` |
 | Job rejected at submit | Submitted from `$HOME` | Clone and submit from your scratch working directory |
+| `non-finite loss` on most batches, several epochs in; the same checkpoint evaluates fine | An fp16-only overflow (eval runs fp32, training runs fp16 autocast) | Run the diagnostic below; it names the module |
+
+### Finding an fp16 overflow
+
+Training runs under fp16 autocast, whose largest finite value is 65504; evaluation runs in
+fp32. A checkpoint that evaluates cleanly but gives a non-finite training loss is therefore
+almost always an fp16 overflow, not a data or loss bug. Two lines in every log help: each
+skip prints which loss terms were non-finite, and each progress line ends with
+`amp_scale=` (the GradScaler's loss scale -- one that keeps halving towards 1 means the
+backward is overflowing).
+
+To locate the origin, resume the suspect checkpoint into a throwaway directory with the
+activation monitor on. `--max-batches` bounds the run even if every batch is skipped
+(`--max-iters` would not: it counts optimizer steps, which stop advancing):
+
+```bash
+sbatch --partition=gpu --gres=gpu:1 --cpus-per-task=8 --mem=48G --time=01:00:00 \
+  --job-name=nan_diag --output=logs/nan_diag_%j.out --error=logs/nan_diag_%j.err \
+  --wrap='cd "$SLURM_SUBMIT_DIR" && source slurm/env.sh && python tools/train.py \
+    --config cam4docc_gmo --resume <checkpoint.pth> --ckpt-dir $DRIFT_CKPT_DIR/_nan_diag \
+    --max-batches 40 --log-interval 1 --num-workers 4 --device cuda --detect-nonfinite'
+```
+
+On a bad batch it prints `[nonfinite] first non-finite output: <module>` with whether that
+module's *input* was already non-finite; at the end, `[headroom]` lists the modules whose
+activations came closest to 65504. Delete `_nan_diag` afterwards.
+
+The overflows found and fixed so far are pinned in `tests/test_fp16_numerics.py`.
 
 ---
 

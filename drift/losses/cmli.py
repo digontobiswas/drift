@@ -29,6 +29,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from drift.utils.precision import graph_zero
+
 __all__ = ["cmli_consistency_loss"]
 
 
@@ -45,11 +47,13 @@ def _masked_l2(imagined: Tensor, real: Tensor, mask: Tensor) -> Optional[Tensor]
     """
     if imagined.shape != real.shape:
         raise ValueError(f"imagined/real shape mismatch: {tuple(imagined.shape)} vs {tuple(real.shape)}")
-    m = mask.to(imagined.dtype)
+    m = mask.float()
     n_valid = m.sum()
     if float(n_valid.item()) == 0.0:
         return None
-    sq_err = (imagined - real).pow(2).mean(dim=2)  # (B,T,X,Y,Z), mean over channels
+    # fp32 before the subtraction: autocast promotes `pow` but not `sub`, so in fp16 the
+    # difference itself could overflow before the square was ever computed in fp32.
+    sq_err = (imagined.float() - real.float()).pow(2).mean(dim=2)  # (B,T,X,Y,Z)
     sq_err = sq_err.flatten(2).mean(dim=2)  # (B,T), mean over space
     return (sq_err * m).sum() / n_valid
 
@@ -88,7 +92,10 @@ def cmli_consistency_loss(
 
     device = aux["imagined_lidar"].device
     dtype = aux["imagined_lidar"].dtype
-    zero = aux["imagined_lidar"].sum() * 0.0 + aux["imagined_cam"].sum() * 0.0
+    # Not `x.sum() * 0.0`: that is NaN as soon as `x` holds one Inf, and this "zero" is
+    # what `loss_cmli_occ` returns on every step of the default config -- so a single
+    # overflowed voxel of the imagined latent made the total loss non-finite.
+    zero = graph_zero(aux["imagined_lidar"], aux["imagined_cam"])
 
     if "real_lidar" in aux:
         lidar_term = _masked_l2(aux["imagined_lidar"], aux["real_lidar"], masks["lidar_mask"])

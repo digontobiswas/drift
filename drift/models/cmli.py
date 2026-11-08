@@ -18,6 +18,8 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 from torch import Tensor, nn
 
+from drift.utils.precision import full_precision, select
+
 __all__ = ["CrossModalLatentImagination", "ModalityDropout"]
 
 
@@ -181,12 +183,25 @@ class CrossModalLatentImagination(nn.Module):
             imagined_l = self.lidar_generator(gen_in_l)
             imagined_c = self.cam_generator(gen_in_c)
 
-            lidar_resolved = lm * l_t + (1.0 - lm) * imagined_l
-            cam_resolved = cm * c_t + (1.0 - cm) * imagined_c
+            # Select, never blend. The masks are binary, so this is the same function as
+            # `lm * l_t + (1 - lm) * imagined_l` -- except under fp16. With every dropout
+            # rate at 0 (the default) `1 - lm` is exactly 0 on every frame, and if the
+            # unnormalised generator output has overflowed to Inf anywhere in the volume,
+            # `0 * Inf = NaN` replaced the *real* latent with NaN and took the whole
+            # forward with it, on every batch. In fp32 the same imagined value is merely
+            # large and `0 * x = 0`, which is why identical weights evaluated cleanly
+            # (eval runs fp32) yet failed every training step under AMP.
+            lidar_resolved = select(lm, l_t, imagined_l)
+            cam_resolved = select(cm, c_t, imagined_c)
 
-            disagreement_t = torch.linalg.vector_norm(
-                lidar_resolved - cam_resolved, dim=1, keepdim=True
-            )
+            # fp32 throughout, output included: the difference of two fp16 latents can
+            # exceed 65504 even when neither does, and so can the norm over channels.
+            # (Autocast already ran `vector_norm` in fp32; the subtraction before it was
+            # the unprotected step.)
+            with full_precision(device.type):
+                disagreement_t = torch.linalg.vector_norm(
+                    lidar_resolved.float() - cam_resolved.float(), dim=1, keepdim=True
+                )
 
             lidar_out_list.append(lidar_resolved)
             cam_out_list.append(cam_resolved)

@@ -26,6 +26,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from drift.utils.precision import full_precision, select
+
 _DEFAULT_LATENT_SIZE = (128, 128, 10)
 _DEFAULT_PC_RANGE = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 
@@ -187,7 +189,9 @@ class InstanceQueryExtractor(nn.Module):
         yaw = self.yaw_head(decoded)
         velocity = self.velocity_head(decoded)
         logits = self.logits_head(decoded)
-        score = torch.sigmoid(self.score_head(decoded))
+        # Sigmoid in fp32: in fp16 any logit above 8.32 rounds to exactly 1.0, which the
+        # objectness loss cannot represent (see `_score_to_logit` in losses/instance.py).
+        score = torch.sigmoid(self.score_head(decoded).float())
 
         return InstanceState(
             center=center, size=size, yaw=yaw, velocity=velocity, logits=logits,
@@ -352,7 +356,9 @@ class MotionForecaster(nn.Module):
             + self.delta_center(hidden).reshape(b, q, 3)  # residual for non-constant-velocity
         )
         new_yaw = yaw + self.delta_yaw(hidden).reshape(b, q, 1)
-        score = torch.sigmoid(self.score_head(hidden)).reshape(b, q, 1)
+        # Sigmoid in fp32: in fp16 any logit above 8.32 rounds to exactly 1.0, which the
+        # objectness loss cannot represent (see `_score_to_logit` in losses/instance.py).
+        score = torch.sigmoid(self.score_head(hidden).float()).reshape(b, q, 1)
         embed_out = hidden.reshape(b, q, self.embed_dims)
         return InstanceState(
             center=new_center, size=state.size, yaw=new_yaw, velocity=new_velocity,
@@ -443,7 +449,10 @@ class InstanceSplatter(nn.Module):
         vx = (x_max - x_min) / x_dim
         vy = (y_max - y_min) / y_dim
         vz = (z_max - z_min) / z_dim
-        voxel_size = torch.tensor([vx, vy, vz], device=states[0].embed.device, dtype=states[0].embed.dtype)
+        # Geometry in fp32 regardless of autocast; outputs are cast back to the input
+        # dtype at the end. See the comment above the loop.
+        out_dtype = states[0].embed.dtype
+        voxel_size = torch.tensor([vx, vy, vz], device=states[0].embed.device, dtype=torch.float32)
         pc_min = torch.tensor([x_min, y_min, z_min], device=voxel_size.device, dtype=voxel_size.dtype)
 
         offsets = self._offsets.to(device=voxel_size.device)  # (W,3) long
@@ -452,97 +461,109 @@ class InstanceSplatter(nn.Module):
         feats_out: List[Tensor] = []
         occ_out: List[Tensor] = []
 
-        for state in states:
-            b, q, c = state.embed.shape
-            if c != self.embed_dims:
-                raise ValueError(
-                    f"InstanceSplatter: state.embed has {c} channels but embed_dims="
-                    f"{self.embed_dims}."
-                )
-
-            feat = self.feat_proj(state.embed)  # (B,Q,out_channels)
-
-            center = state.center  # (B,Q,3)
-            size = state.size  # (B,Q,3)
-            yaw = state.yaw[..., 0]  # (B,Q)
-            score = state.score[..., 0]  # (B,Q)
-
-            vox_coord = (center - pc_min) / voxel_size - 0.5  # (B,Q,3) continuous voxel index
-            anchor = torch.round(vox_coord.detach()).long()  # (B,Q,3)
-
-            abs_idx = anchor.unsqueeze(2) + offsets.reshape(1, 1, w, 3)  # (B,Q,W,3)
-            valid = (
-                (abs_idx[..., 0] >= 0) & (abs_idx[..., 0] < x_dim)
-                & (abs_idx[..., 1] >= 0) & (abs_idx[..., 1] < y_dim)
-                & (abs_idx[..., 2] >= 0) & (abs_idx[..., 2] < z_dim)
-            )  # (B,Q,W)
-            clipped = torch.stack(
-                [
-                    abs_idx[..., 0].clamp(0, x_dim - 1),
-                    abs_idx[..., 1].clamp(0, y_dim - 1),
-                    abs_idx[..., 2].clamp(0, z_dim - 1),
-                ],
-                dim=-1,
-            )  # (B,Q,W,3)
-
-            anchor_metric = pc_min + (anchor.to(voxel_size.dtype) + 0.5) * voxel_size  # (B,Q,3)
-            voxel_metric = anchor_metric.unsqueeze(2) + offsets.reshape(1, 1, w, 3).to(voxel_size.dtype) * voxel_size
-            # (B,Q,W,3)
-            delta = voxel_metric - center.unsqueeze(2)  # (B,Q,W,3), differentiable wrt center
-
-            cos_y = torch.cos(yaw).unsqueeze(-1)  # (B,Q,1)
-            sin_y = torch.sin(yaw).unsqueeze(-1)
-            dx, dy, dz = delta[..., 0], delta[..., 1], delta[..., 2]
-            local_x = dx * cos_y + dy * sin_y
-            local_y = -dx * sin_y + dy * cos_y
-            local_z = dz
-
-            half = size / 2.0  # (B,Q,3)
-            std_x = (half[..., 0:1] * self.sigma).clamp_min(1e-3)
-            std_y = (half[..., 1:2] * self.sigma).clamp_min(1e-3)
-            std_z = (half[..., 2:3] * self.sigma).clamp_min(1e-3)
-
-            if self.soft:
-                gauss = torch.exp(
-                    -0.5
-                    * (
-                        (local_x / std_x) ** 2
-                        + (local_y / std_y) ** 2
-                        + (local_z / std_z) ** 2
+        # The whole splat runs in fp32. Under fp16 it had three ways to go non-finite,
+        # none of which exist in fp32: `local / std` with `std` clamped to 1e-3 overflows
+        # for any offset over ~65 m, which an unbounded integrated `center` reaches;
+        # `weight * valid` with `valid == 0` turned an overflowed weight into NaN
+        # (0 * Inf); and the Gaussian weight times a saturated `feat_proj` output did the
+        # same for every out-of-window voxel. The tensors here are per-query (300 x 245
+        # window voxels), so fp32 costs almost nothing.
+        with full_precision(voxel_size.device.type):
+            for state in states:
+                b, q, c = state.embed.shape
+                if c != self.embed_dims:
+                    raise ValueError(
+                        f"InstanceSplatter: state.embed has {c} channels but embed_dims="
+                        f"{self.embed_dims}."
                     )
-                )
-            else:
-                inside = (
-                    (local_x.abs() <= half[..., 0:1]) & (local_y.abs() <= half[..., 1:2])
-                    & (local_z.abs() <= half[..., 2:3])
-                )
-                gauss = inside.to(voxel_size.dtype)
 
-            weight = gauss * score.unsqueeze(-1)  # (B,Q,W)
-            weight = weight * valid.to(weight.dtype)
+                feat = self.feat_proj(state.embed.float())  # (B,Q,out_channels)
 
-            flat_idx = (clipped[..., 0] * y_dim + clipped[..., 1]) * z_dim + clipped[..., 2]  # (B,Q,W)
-            flat_idx = flat_idx.reshape(b, q * w)
+                center = state.center.float()  # (B,Q,3)
+                size = state.size.float()  # (B,Q,3)
+                yaw = state.yaw[..., 0].float()  # (B,Q)
+                score = state.score[..., 0].float()  # (B,Q)
 
-            contrib_feat = weight.unsqueeze(-1) * feat.unsqueeze(2)  # (B,Q,W,out_channels)
-            contrib_feat = contrib_feat.reshape(b, q * w, self.out_channels)
-            contrib_occ = weight.reshape(b, q * w, 1)
+                vox_coord = (center - pc_min) / voxel_size - 0.5  # (B,Q,3) continuous voxel index
+                # `.long()` of Inf/NaN is undefined behaviour; bound it first. Anything
+                # this far out is outside the grid and masked by `valid` regardless.
+                anchor = torch.round(
+                    vox_coord.detach().nan_to_num(nan=-1e4, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
+                ).long()  # (B,Q,3)
 
-            n = x_dim * y_dim * z_dim
-            grid_feat = torch.zeros(b, n, self.out_channels, device=voxel_size.device, dtype=feat.dtype)
-            grid_occ = torch.zeros(b, n, 1, device=voxel_size.device, dtype=feat.dtype)
+                abs_idx = anchor.unsqueeze(2) + offsets.reshape(1, 1, w, 3)  # (B,Q,W,3)
+                valid = (
+                    (abs_idx[..., 0] >= 0) & (abs_idx[..., 0] < x_dim)
+                    & (abs_idx[..., 1] >= 0) & (abs_idx[..., 1] < y_dim)
+                    & (abs_idx[..., 2] >= 0) & (abs_idx[..., 2] < z_dim)
+                )  # (B,Q,W)
+                clipped = torch.stack(
+                    [
+                        abs_idx[..., 0].clamp(0, x_dim - 1),
+                        abs_idx[..., 1].clamp(0, y_dim - 1),
+                        abs_idx[..., 2].clamp(0, z_dim - 1),
+                    ],
+                    dim=-1,
+                )  # (B,Q,W,3)
 
-            idx_feat = flat_idx.unsqueeze(-1).expand(-1, -1, self.out_channels)
-            idx_occ = flat_idx.unsqueeze(-1)
+                anchor_metric = pc_min + (anchor.to(voxel_size.dtype) + 0.5) * voxel_size  # (B,Q,3)
+                voxel_metric = anchor_metric.unsqueeze(2) + offsets.reshape(1, 1, w, 3).to(voxel_size.dtype) * voxel_size
+                # (B,Q,W,3)
+                delta = voxel_metric - center.unsqueeze(2)  # (B,Q,W,3), differentiable wrt center
 
-            grid_feat = grid_feat.scatter_add(1, idx_feat, contrib_feat)
-            grid_occ = grid_occ.scatter_add(1, idx_occ, contrib_occ)
+                cos_y = torch.cos(yaw).unsqueeze(-1)  # (B,Q,1)
+                sin_y = torch.sin(yaw).unsqueeze(-1)
+                dx, dy, dz = delta[..., 0], delta[..., 1], delta[..., 2]
+                local_x = dx * cos_y + dy * sin_y
+                local_y = -dx * sin_y + dy * cos_y
+                local_z = dz
 
-            grid_feat = grid_feat.reshape(b, x_dim, y_dim, z_dim, self.out_channels).permute(0, 4, 1, 2, 3)
-            grid_occ = grid_occ.reshape(b, x_dim, y_dim, z_dim, 1).permute(0, 4, 1, 2, 3)
+                half = size / 2.0  # (B,Q,3)
+                std_x = (half[..., 0:1] * self.sigma).clamp_min(1e-3)
+                std_y = (half[..., 1:2] * self.sigma).clamp_min(1e-3)
+                std_z = (half[..., 2:3] * self.sigma).clamp_min(1e-3)
 
-            feats_out.append(grid_feat)
-            occ_out.append(grid_occ)
+                if self.soft:
+                    gauss = torch.exp(
+                        -0.5
+                        * (
+                            (local_x / std_x) ** 2
+                            + (local_y / std_y) ** 2
+                            + (local_z / std_z) ** 2
+                        )
+                    )
+                else:
+                    inside = (
+                        (local_x.abs() <= half[..., 0:1]) & (local_y.abs() <= half[..., 1:2])
+                        & (local_z.abs() <= half[..., 2:3])
+                    )
+                    gauss = inside.to(voxel_size.dtype)
+
+                weight = gauss * score.unsqueeze(-1)  # (B,Q,W)
+                weight = select(valid, weight, torch.zeros_like(weight))
+
+                flat_idx = (clipped[..., 0] * y_dim + clipped[..., 1]) * z_dim + clipped[..., 2]  # (B,Q,W)
+                flat_idx = flat_idx.reshape(b, q * w)
+
+                contrib_feat = weight.unsqueeze(-1) * feat.unsqueeze(2)  # (B,Q,W,out_channels)
+                contrib_feat = contrib_feat.reshape(b, q * w, self.out_channels)
+                contrib_occ = weight.reshape(b, q * w, 1)
+
+                n = x_dim * y_dim * z_dim
+                grid_feat = torch.zeros(b, n, self.out_channels, device=voxel_size.device, dtype=feat.dtype)
+                grid_occ = torch.zeros(b, n, 1, device=voxel_size.device, dtype=feat.dtype)
+
+                idx_feat = flat_idx.unsqueeze(-1).expand(-1, -1, self.out_channels)
+                idx_occ = flat_idx.unsqueeze(-1)
+
+                grid_feat = grid_feat.scatter_add(1, idx_feat, contrib_feat)
+                grid_occ = grid_occ.scatter_add(1, idx_occ, contrib_occ)
+
+                grid_feat = grid_feat.reshape(b, x_dim, y_dim, z_dim, self.out_channels).permute(0, 4, 1, 2, 3)
+                grid_occ = grid_occ.reshape(b, x_dim, y_dim, z_dim, 1).permute(0, 4, 1, 2, 3)
+
+                feats_out.append(grid_feat.to(out_dtype))
+                occ_out.append(grid_occ.to(out_dtype))
 
         dyn_feats = torch.stack(feats_out, dim=1)  # (B,T_o,out_channels,X,Y,Z)
         dyn_occ = torch.stack(occ_out, dim=1)  # (B,T_o,1,X,Y,Z)
