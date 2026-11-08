@@ -127,8 +127,15 @@ MAX_STALLS="${DRIFT_MAX_STALLS:-8}"
 read -r END_EPOCH END_STEP < <(python tools/ckpt_info.py "$CKPT")
 echo "[train] reached epoch=$END_EPOCH step=$END_STEP (target $EPOCHS epochs)"
 
+# Email on every link's end/failure when DRIFT_MAIL is set, so a chain that stops is noticed
+# the same day. The October run's chain stopped on Oct 16 and the GPU then sat idle for three
+# weeks because nothing told anyone. Start the chain with mail on and it stays on:
+#     sbatch --mail-type=END,FAIL --mail-user=you@example.com \
+#            --export=ALL,DRIFT_MAIL=you@example.com slurm/02_train.slurm
 requeue() {  # $1 = stall count to carry into the next job
-    sbatch --export=ALL,CONFIG="$CONFIG",EPOCHS="$EPOCHS",BATCH_SIZE="$BATCH_SIZE",\
+    # shellcheck disable=SC2086  # intentionally unquoted: expands to nothing or to two flags
+    sbatch ${DRIFT_MAIL:+--mail-type=END,FAIL --mail-user=$DRIFT_MAIL} \
+        --export=ALL,CONFIG="$CONFIG",EPOCHS="$EPOCHS",BATCH_SIZE="$BATCH_SIZE",\
 NUM_WORKERS="$NUM_WORKERS",NGPU="$NGPU",DRIFT_STALL_COUNT="$1" \
         "${SLURM_SUBMIT_DIR:-$PWD}/slurm/02_train.slurm"
 }
@@ -143,6 +150,9 @@ elif [[ "$END_STEP" -le "$START_STEP" ]]; then
         echo "[train] !! $STALLS consecutive runs banked no progress; stopping the chain." >&2
         echo "[train]    This is no longer bad luck -- inspect logs/train_${SLURM_JOB_ID}.err." >&2
         echo "[train]    Restart with: sbatch slurm/02_train.slurm" >&2
+        # Non-zero, so Slurm records the chain's end as FAILED (and mails, if enabled)
+        # rather than as an ordinary COMPLETED link that is easy to miss in sacct.
+        exit 1
     else
         echo "[train] no progress this run (step $START_STEP -> $END_STEP), stall $STALLS/$MAX_STALLS -- retrying"
         requeue "$STALLS"

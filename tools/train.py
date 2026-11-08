@@ -623,6 +623,12 @@ def main(argv: Optional[list] = None) -> None:
     )
 
     model = DRIFT(cfg.model, cfg.loss).to(device)
+    if is_main:
+        print(
+            f"[train] fp16 guard: {len(model.norm_fed_convs)} conv->GroupNorm layers in "
+            "Sequentials plus E4A's conv blocks are overflow-protected (NormFedConv).",
+            flush=True,
+        )
     if world_size > 1:
         find_unused = not cfg.model.forecaster.use_instance_path or not cfg.model.cmli.enabled
         model = DistributedDataParallel(

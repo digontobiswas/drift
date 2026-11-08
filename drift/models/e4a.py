@@ -28,6 +28,7 @@ import torch.utils.checkpoint  # explicit: `import torch` alone need not bind th
 from torch import Tensor, nn
 
 from drift.models.taf import TriplingAttentionFusion
+from drift.utils.precision import NormFedConv3d
 
 
 def _auto_num_heads(channels: int, max_heads: int = 8) -> int:
@@ -44,7 +45,11 @@ def _half_size(size: Tuple[int, int, int]) -> Tuple[int, int, int]:
 class _ConvBnAct(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3) -> None:
         super().__init__()
-        self.conv = nn.Conv3d(in_ch, out_ch, kernel_size, padding=kernel_size // 2)
+        # Feeds the GroupNorm directly (see forward), so it is scale-invariant and its fp16
+        # output would overflow as its weights drift; NormFedConv3d removes that without
+        # changing the result. `observer.e4a.up_fuse.0.conv` had reached 37% of fp16's
+        # limit by epoch 5.
+        self.conv = NormFedConv3d(in_ch, out_ch, kernel_size, padding=kernel_size // 2)
         self.norm = nn.GroupNorm(_auto_num_heads(out_ch, 8), out_ch)
         self.act = nn.GELU()
 

@@ -101,6 +101,7 @@ from drift.models.observer import Observer
 from drift.models.predictor import FlowHead, OccupancyHead, UncertaintyHead
 from drift.models.refiner import Refiner
 from drift.models.static_path import StaticForecastPath
+from drift.utils.precision import protect_norm_fed_convs
 
 if TYPE_CHECKING:  # pragma: no cover - type-checking only, avoids a hard runtime dependency
     from configs.base import LossConfig, ModelConfig
@@ -385,6 +386,15 @@ class DRIFT(nn.Module):
                 if module is not self and hasattr(module, "grad_checkpoint"):
                     module.grad_checkpoint = True
                     module.grad_checkpoint_reentrant = self.grad_checkpoint_reentrant
+
+        # Every conv that feeds straight into a GroupNorm is scale-invariant, so its weights
+        # drift upward unchecked and its raw fp16 output eventually overflows -- the cause of
+        # the NaN that stopped both full training runs around epoch 6 (the CMLI LiDAR
+        # generator's middle conv was at 99% of fp16's limit). Converting them changes no
+        # parameter, no state_dict key and, because the norm divides the scale back out, no
+        # output: see `drift.utils.precision.NormFedConv3d`. `_ConvBnAct` in e4a.py is
+        # converted where it is defined, since its pairing is inside a custom forward.
+        self.norm_fed_convs: List[str] = protect_norm_fed_convs(self)
 
     def _ckpt(self, fn: Any, *args: Any) -> Any:
         """Run ``fn(*args)`` under gradient checkpointing when it is enabled.

@@ -254,3 +254,109 @@ class TestDiagnosticRun:
         assert "--detect-nonfinite: watching" in result.stdout
         assert "[headroom] largest activations seen" in result.stdout
         assert result.stdout.count("[train] epoch=0 it=") == 2
+
+
+class TestNormFedConv:
+    """The fix for the overflow that actually stopped both full runs.
+
+    `cmli.lidar_generator.net.3` -- a conv feeding a GroupNorm -- reached 99.2% of fp16's
+    limit by epoch 5 and then overflowed on every batch (diagnostic job 1225732). A conv
+    before a GroupNorm is scale-invariant, so nothing stops its weights growing. The fix
+    must (1) make overflow impossible, (2) change neither the function nor the gradients,
+    (3) be an exact no-op at initialisation, and (4) leave checkpoints loadable.
+    """
+
+    @staticmethod
+    def _pair(scale: float, conv_cls=torch.nn.Conv3d):
+        torch.manual_seed(0)
+        conv = conv_cls(8, 8, 3, padding=1)
+        with torch.no_grad():
+            conv.weight.mul_(scale)
+            conv.bias.mul_(scale)
+        return conv, torch.nn.GroupNorm(2, 8)
+
+    def test_plain_fp16_conv_overflows_where_the_fixed_one_does_not(self) -> None:
+        from drift.utils.precision import NormFedConv3d
+        conv, gn = self._pair(scale=2000.0)
+        x = torch.rand(1, 8, 6, 6, 4) * 140  # the input range seen on the cluster
+        plain = conv.half()(x.half())
+        assert torch.isinf(plain).any(), "precondition: the plain fp16 conv must overflow"
+        conv.__class__ = NormFedConv3d
+        fixed = conv(x.half())
+        assert torch.isfinite(fixed).all()
+        assert torch.isfinite(gn(fixed.float())).all()
+
+    def test_output_is_provably_bounded(self) -> None:
+        from drift.utils.precision import NORM_FED_TARGET, NormFedConv3d
+        conv, _ = self._pair(scale=1e4)
+        conv.__class__ = NormFedConv3d
+        for _ in range(5):
+            x = torch.randn(1, 8, 5, 5, 3) * 1e3
+            assert conv(x).abs().max().item() <= NORM_FED_TARGET * (1 + 1e-5)
+
+    def test_function_and_gradients_match_the_plain_conv(self) -> None:
+        from drift.utils.precision import NormFedConv3d
+        x = torch.randn(1, 8, 6, 6, 4) * 50
+        results = []
+        for cls in (torch.nn.Conv3d, NormFedConv3d):
+            conv, gn = self._pair(scale=300.0)
+            conv.__class__ = cls
+            out = gn(conv(x))
+            (out * torch.linspace(-1, 1, out.numel()).view_as(out)).sum().backward()
+            results.append((out.detach(), conv.weight.grad.clone(), conv.bias.grad.clone()))
+        (o1, gw1, gb1), (o2, gw2, gb2) = results
+        assert torch.allclose(o1, o2, rtol=1e-4, atol=1e-5)
+        assert torch.allclose(gw1, gw2, rtol=1e-3, atol=1e-7)
+        assert torch.allclose(gb1, gb2, rtol=1e-3, atol=1e-7)
+
+    def test_exact_no_op_at_default_initialisation(self) -> None:
+        """A fresh run must start exactly where it always did."""
+        from drift.utils.precision import NormFedConv3d, _norm_fed_scale
+        torch.manual_seed(0)
+        plain = torch.nn.Conv3d(64, 64, 3, padding=1)
+        fixed = torch.nn.Conv3d(64, 64, 3, padding=1)
+        fixed.load_state_dict(plain.state_dict())
+        fixed.__class__ = NormFedConv3d
+        x = torch.randn(1, 64, 6, 6, 4)  # roughly what a GroupNorm emits at init
+        assert _norm_fed_scale(fixed, x).item() == 1.0
+        assert torch.equal(plain(x), fixed(x))
+
+    def test_only_conv_directly_before_groupnorm_is_converted(self) -> None:
+        from drift.utils.precision import NormFedConv2d, protect_norm_fed_convs
+        nn = torch.nn
+        model = nn.ModuleDict({
+            "a": nn.Sequential(nn.Conv2d(3, 8, 3), nn.GroupNorm(2, 8), nn.ReLU()),
+            "b": nn.Sequential(nn.Conv2d(3, 8, 3), nn.ReLU(), nn.GroupNorm(2, 8)),
+            "c": nn.Sequential(nn.Conv2d(3, 8, 3), nn.BatchNorm2d(8)),
+            "d": nn.Sequential(nn.Conv2d(3, 8, 3), nn.Conv2d(8, 8, 3), nn.GroupNorm(2, 8)),
+        })
+        assert sorted(protect_norm_fed_convs(model)) == ["a.0", "d.1"]
+        assert isinstance(model["a"][0], NormFedConv2d)
+        assert type(model["b"][0]) is nn.Conv2d
+        assert type(model["c"][0]) is nn.Conv2d, "BatchNorm in eval mode is not scale-invariant"
+        assert type(model["d"][0]) is nn.Conv2d
+
+    def test_real_model_converts_the_layers_that_overflowed(self) -> None:
+        from configs import get_config
+        from drift.models.drift import DRIFT
+        from drift.utils.precision import NormFedConv3d
+        cfg = get_config("tiny")
+        model = DRIFT(cfg.model, cfg.loss)
+        names = set(model.norm_fed_convs)
+        assert {"cmli.lidar_generator.net.3", "cmli.cam_generator.net.3"} <= names
+        e4a_convs = [n for n, m in model.named_modules()
+                     if isinstance(m, NormFedConv3d) and ".e4a." in n and n.endswith(".conv")]
+        assert e4a_convs, "E4A's _ConvBnAct convs must be converted too"
+
+    def test_checkpoint_keys_are_unchanged(self) -> None:
+        """Conversion swaps the class, not the parameters: old checkpoints load as-is."""
+        from configs import get_config
+        from drift.models.drift import DRIFT
+        from drift.utils.precision import protect_norm_fed_convs
+        cfg = get_config("tiny")
+        model = DRIFT(cfg.model, cfg.loss)
+        keys = list(model.state_dict().keys())
+        protect_norm_fed_convs(model)  # idempotent: a second pass finds nothing new to change
+        assert list(model.state_dict().keys()) == keys
+        fresh = DRIFT(cfg.model, cfg.loss)
+        fresh.load_state_dict(model.state_dict(), strict=True)
