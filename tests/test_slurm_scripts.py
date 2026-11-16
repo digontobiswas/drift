@@ -70,3 +70,30 @@ def test_strict_mode_is_on(script: Path) -> None:
     assert re.search(r"^set -euo pipefail\s*$", script.read_text(), re.M), (
         f"{script.name} does not enable strict mode"
     )
+
+
+def _sbatch_directives(script: Path) -> dict:
+    return dict(re.findall(r"^#SBATCH --([a-z-]+)=(\S+)", script.read_text(), re.M))
+
+
+def test_ablations_run_under_the_main_runs_exact_budget() -> None:
+    """The main 02_train run is the full-model row of the ablation table, so every ablation
+    must train under identical conditions. When 03 asked for 2 GPUs against 02's 1, DDP
+    halved the steps per epoch and the table showed every ablation beating the full model."""
+    main = _sbatch_directives(SLURM_DIR / "02_train.slurm")
+    abl = _sbatch_directives(SLURM_DIR / "03_ablations.slurm")
+    for key in ("gres", "cpus-per-task", "mem", "time", "partition"):
+        assert abl[key] == main[key], f"--{key}: ablations {abl[key]!r} vs main run {main[key]!r}"
+
+
+def test_ablation_grid_does_not_retrain_the_full_model_by_default() -> None:
+    """Task 0 would write into the main run's checkpoint directory."""
+    assert _sbatch_directives(SLURM_DIR / "03_ablations.slurm")["array"] == "1-6"
+    assert "ABL_INCLUDE_FULL" in (SLURM_DIR / "03_ablations.slurm").read_text()
+
+
+@pytest.mark.parametrize("name", ["02_train.slurm", "03_ablations.slurm"])
+def test_training_chains_tolerate_stalled_runs(name: str) -> None:
+    """Crashes here are stochastic; a run that dies before its first checkpoint is usually
+    unlucky, not doomed. A chain that stops on the first one dies silently overnight."""
+    assert "DRIFT_MAX_STALLS" in (SLURM_DIR / name).read_text()
