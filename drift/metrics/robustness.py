@@ -74,12 +74,19 @@ def apply_modality_dropout(
     out = dict(batch)
     lidar_mask = batch["lidar_mask"]
     cam_mask = batch["cam_mask"]
+    # Draw on the generator's own device and move the result, never `device=mask.device`:
+    # `evaluate_robustness` seeds a CPU generator per scenario while the masks live on the
+    # GPU, and torch.rand refuses that pairing ("Expected a 'cuda' device type for generator
+    # but found 'cpu'"). That error killed the robustness job after its clean scenario. A
+    # CPU draw also makes the dropped frames identical on any device, so CPU and GPU runs of
+    # the study drop the same frames.
+    gen_device = generator.device if generator is not None else torch.device("cpu")
     if lidar_dropout > 0:
-        keep = torch.rand(lidar_mask.shape, generator=generator, device=lidar_mask.device) >= lidar_dropout
-        out["lidar_mask"] = lidar_mask * keep.to(lidar_mask.dtype)
+        keep = torch.rand(lidar_mask.shape, generator=generator, device=gen_device) >= lidar_dropout
+        out["lidar_mask"] = lidar_mask * keep.to(device=lidar_mask.device, dtype=lidar_mask.dtype)
     if cam_dropout > 0:
-        keep = torch.rand(cam_mask.shape, generator=generator, device=cam_mask.device) >= cam_dropout
-        out["cam_mask"] = cam_mask * keep.to(cam_mask.dtype)
+        keep = torch.rand(cam_mask.shape, generator=generator, device=gen_device) >= cam_dropout
+        out["cam_mask"] = cam_mask * keep.to(device=cam_mask.device, dtype=cam_mask.dtype)
     return out
 
 
