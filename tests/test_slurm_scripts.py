@@ -97,3 +97,74 @@ def test_training_chains_tolerate_stalled_runs(name: str) -> None:
     """Crashes here are stochastic; a run that dies before its first checkpoint is usually
     unlucky, not doomed. A chain that stops on the first one dies silently overnight."""
     assert "DRIFT_MAX_STALLS" in (SLURM_DIR / name).read_text()
+
+
+@pytest.mark.parametrize("name", ["02_train.slurm", "03_ablations.slurm"])
+def test_walltime_warning_reaches_the_training_process(name: str) -> None:
+    """`--signal=USR1@600` without `B:` signals srun job steps only, and train.py is not one,
+    so the warning reached nobody: every link that hit the 72-hour limit was killed with its
+    batch shell and never submitted its follow-up. Three ablation chains ended that way."""
+    text = (SLURM_DIR / name).read_text()
+    assert re.search(r"^#SBATCH --signal=B:USR1@\d+", text, re.M), "signal must go to the batch shell"
+    assert re.search(r'run_forwarding_usr1 "\$\{TRAIN_CMD\[@\]\}"', text), (
+        "train.py must be launched through run_forwarding_usr1, or the shell never forwards it"
+    )
+
+
+def _run_forwarding(tmp_path: Path, child_src: str, send_usr1: bool):
+    """Run run_forwarding_usr1 on a python child under bash, optionally signalling the shell
+    the way Slurm's `B:` does, and return (stdout, script exit code)."""
+    import sys
+    import time
+
+    child = tmp_path / "child.py"
+    child.write_text(child_src)
+    script = tmp_path / "job.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        f"source {SLURM_DIR / 'forward_signal.sh'}\n"
+        f"TRAIN_CMD=({sys.executable} {child})\n"
+        'RC=0\nrun_forwarding_usr1 "${TRAIN_CMD[@]}" || RC=$?\n'
+        'echo "[script] after training, rc=$RC"\n'
+    )
+    proc = subprocess.Popen(["bash", str(script)], stdout=subprocess.PIPE, text=True)
+    if send_usr1:
+        time.sleep(1.0)
+        proc.send_signal(__import__("signal").SIGUSR1)
+    out, _ = proc.communicate(timeout=60)
+    return out, proc.returncode
+
+
+_CHILD = """
+import signal, sys, time
+stop = False
+def h(*_):
+    global stop
+    stop = True
+signal.signal(signal.SIGUSR1, h)
+for _ in range(400):
+    if stop:
+        print("[child] saved and exiting", flush=True)
+        sys.exit(0)
+    time.sleep(0.02)
+print("[child] ran to completion", flush=True)
+"""
+
+
+def test_forwarded_signal_lets_the_child_save_and_the_script_continue(tmp_path) -> None:
+    out, rc = _run_forwarding(tmp_path, _CHILD, send_usr1=True)
+    assert "[child] saved and exiting" in out
+    assert "[script] after training, rc=0" in out, "the requeue logic must still run"
+    assert rc == 0
+
+
+def test_without_a_signal_the_child_runs_normally(tmp_path) -> None:
+    out, _ = _run_forwarding(tmp_path, _CHILD, send_usr1=False)
+    assert "[child] ran to completion" in out and "rc=0" in out
+
+
+def test_a_crash_is_reported_with_the_childs_status(tmp_path) -> None:
+    """A SIGSEGV must still reach the stall/requeue logic, with status 139."""
+    crash = "import os, signal\nos.kill(os.getpid(), signal.SIGSEGV)\n"
+    out, rc = _run_forwarding(tmp_path, crash, send_usr1=False)
+    assert "rc=139" in out and rc == 0

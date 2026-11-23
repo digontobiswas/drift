@@ -9,7 +9,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --signal=USR1@600
+#SBATCH --signal=B:USR1@600
 #
 # Train ONE config.
 #
@@ -38,9 +38,12 @@
 # A full run is ~4 days but the gpu partition allows 72 hours, so every run is
 # interrupted at least once. That is handled end to end, with no manual step:
 #
-#   1. `--signal=USR1@600` makes Slurm send SIGUSR1 ten minutes before the hard
-#      kill. tools/train.py catches it, finishes the step in flight, writes a
-#      checkpoint at that exact position, and exits cleanly.
+#   1. `--signal=B:USR1@600` makes Slurm send SIGUSR1 to this script ten minutes
+#      before the hard kill; run_forwarding_usr1 passes it on to tools/train.py,
+#      which finishes the step in flight, writes a checkpoint at that exact
+#      position, and exits cleanly. (Without the `B:` and the forwarding the signal
+#      reached nobody, and a link that hit the walltime ended its chain -- see
+#      slurm/forward_signal.sh.)
 #   2. On startup this script auto-resumes from `latest.pth` if one exists.
 #   3. When the run ends without having reached the final epoch, it submits its
 #      own successor, which picks up from that checkpoint.
@@ -88,15 +91,20 @@ fi
 
 # `set -e` would abort before the requeue logic if training exits non-zero, so the
 # exit status is captured rather than allowed to kill the script.
+TRAIN_CMD=(
+    "${LAUNCH[@]}"
+    --config "$CONFIG"
+    --epochs "$EPOCHS"
+    --batch-size "$BATCH_SIZE"
+    --num-workers "$NUM_WORKERS"
+    --device cuda
+    --log-interval 50
+)
+if [[ -n "${RESUME:-}" ]]; then
+    TRAIN_CMD+=(--resume "$RESUME")
+fi
 TRAIN_RC=0
-"${LAUNCH[@]}" \
-    --config "$CONFIG" \
-    --epochs "$EPOCHS" \
-    --batch-size "$BATCH_SIZE" \
-    --num-workers "$NUM_WORKERS" \
-    --device cuda \
-    --log-interval 50 \
-    ${RESUME:+--resume "$RESUME"} || TRAIN_RC=$?
+run_forwarding_usr1 "${TRAIN_CMD[@]}" || TRAIN_RC=$?
 
 echo "[train] $CONFIG exited with status $TRAIN_RC. Checkpoints in $DRIFT_CKPT_DIR/$CONFIG"
 

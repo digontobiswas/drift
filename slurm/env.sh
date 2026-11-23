@@ -87,6 +87,10 @@ export PYTHONPATH="$DRIFT_REPO:${PYTHONPATH:-}"
 
 mkdir -p "$DRIFT_CKPT_DIR" "$DRIFT_RESULTS_DIR" "$DRIFT_REPO/logs"
 
+# Launch helper that lets the walltime warning reach train.py; see the file for why.
+# shellcheck disable=SC1091
+source "$DRIFT_REPO/slurm/forward_signal.sh"
+
 echo "--- DRIFT job environment ---"
 echo "  host          : $(hostname)"
 echo "  job           : ${SLURM_JOB_ID:-<interactive>} ${SLURM_ARRAY_TASK_ID:+array task $SLURM_ARRAY_TASK_ID}"

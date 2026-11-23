@@ -9,7 +9,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --signal=USR1@600
+#SBATCH --signal=B:USR1@600
 #SBATCH --array=1-6
 #
 # The six single-axis ablations of the full model, one array task each:
@@ -98,8 +98,10 @@ else
     echo "[abl] no checkpoint at $CKPT -- starting $CONFIG from scratch"
 fi
 
+# Through run_forwarding_usr1 (slurm/forward_signal.sh), so the walltime warning reaches
+# train.py and this script survives to submit the follow-up job.
 TRAIN_RC=0
-"${TRAIN_CMD[@]}" || TRAIN_RC=$?
+run_forwarding_usr1 "${TRAIN_CMD[@]}" || TRAIN_RC=$?
 
 echo "[abl] $CONFIG exited with status $TRAIN_RC -> $DRIFT_CKPT_DIR/$CONFIG"
 
