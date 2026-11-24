@@ -97,6 +97,21 @@ if [[ -f "$CKPT" ]]; then
 else
     echo "[abl] no checkpoint at $CKPT -- starting $CONFIG from scratch"
 fi
+# Extra train.py flags for one config, carried to its follow-up jobs by --export=ALL. Only
+# for settings that leave the arithmetic unchanged, so the ablation stays comparable -- e.g.
+# lidar_only, which segfaulted on the same sample eight restarts in a row and ran through it
+# with gradient checkpointing and data-loader workers off:
+#     ( export ABL_EXTRA_ARGS="--no-grad-checkpoint --num-workers 0" CUDA_LAUNCH_BLOCKING=1
+#       sbatch --array=5 slurm/03_ablations.slurm )
+# Appended last, so a repeated flag (--num-workers) overrides the default above. Split into
+# its own array only inside this guard: an empty array expanded under `set -u` is an error
+# on the compute nodes' bash 4.2.
+if [[ -n "${ABL_EXTRA_ARGS:-}" ]]; then
+    read -r -a ABL_EXTRA <<< "$ABL_EXTRA_ARGS"
+    TRAIN_CMD+=("${ABL_EXTRA[@]}")
+    echo "[abl] extra train.py flags: ${ABL_EXTRA_ARGS}"
+fi
+echo "[abl] CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-0}"
 
 # Through run_forwarding_usr1 (slurm/forward_signal.sh), so the walltime warning reaches
 # train.py and this script survives to submit the follow-up job.
